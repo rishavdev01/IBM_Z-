@@ -1,0 +1,86 @@
+{
+  "feature_order": [
+    "amount",
+    "hour_of_day",
+    "channel_code",
+    "sender_out_degree_24h",
+    "sender_txn_count_1h",
+    "receiver_in_degree_24h",
+    "receiver_in_amount_24h",
+    "receiver_out_amount_24h",
+    "receiver_forward_ratio",
+    "receiver_min_forward_seconds",
+    "in_cycle",
+    "cycle_length",
+    "sender_seconds_since_last_inbound",
+    "sender_forward_ratio",
+    "sender_new_device",
+    "amount_vs_sender_avg"
+  ],
+  "benign_medians": {
+    "amount": 1508.5817373307768,
+    "hour_of_day": 11.0,
+    "channel_code": 0.0,
+    "sender_out_degree_24h": 3.0,
+    "sender_txn_count_1h": 2.0,
+    "receiver_in_degree_24h": 3.0,
+    "receiver_in_amount_24h": 5049.624838531752,
+    "receiver_out_amount_24h": 2473.127331686767,
+    "receiver_forward_ratio": 0.19858819881612538,
+    "receiver_min_forward_seconds": 7200.0,
+    "in_cycle": 0.0,
+    "cycle_length": 0.0,
+    "sender_seconds_since_last_inbound": 3600.0,
+    "sender_forward_ratio": 0.16998431630035446,
+    "sender_new_device": 0.0,
+    "amount_vs_sender_avg": 1.0030428633480846
+  },
+  "metrics": {
+    "lightgbm": {
+      "roc_auc": 1.0,
+      "pr_auc": 0.9999,
+      "precision_40": 1.0,
+      "recall_40": 0.9845,
+      "precision_70": 1.0,
+      "recall_70": 0.9845,
+      "typology_recall": {
+        "mule_fan_in": 1.0,
+        "rapid_forwarding": 0.9737,
+        "circular_layering": 1.0,
+        "account_takeover": 0.9655
+      }
+    },
+    "sklearn": {
+      "roc_auc": 1.0,
+      "pr_auc": 1.0,
+      "precision_40": 1.0,
+      "recall_40": 1.0,
+      "precision_70": 1.0,
+      "recall_70": 1.0,
+      "typology_recall": {
+        "mule_fan_in": 1.0,
+        "rapid_forwarding": 1.0,
+        "circular_layering": 1.0,
+        "account_takeover": 1.0
+      }
+    },
+    "rule_baseline": {
+      "roc_auc": 1.0,
+      "pr_auc": 1.0,
+      "precision_40": 1.0,
+      "recall_40": 1.0,
+      "precision_70": 1.0,
+      "recall_70": 1.0,
+      "typology_recall": {
+        "mule_fan_in": 1.0,
+        "rapid_forwarding": 1.0,
+        "circular_layering": 1.0,
+        "account_takeover": 1.0
+      }
+    }
+  },
+  "thresholds": {
+    "alert": 0.4,
+    "high": 0.7
+  }
+}
