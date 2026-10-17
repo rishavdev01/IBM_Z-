@@ -1,0 +1,5 @@
+streamlit>=1.30.0
+pandas>=2.0.0
+plotly>=5.18.0
+pyvis>=0.3.2
+httpx>=0.25.0

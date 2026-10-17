@@ -1,0 +1,54 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: aegis-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - AEGIS_DB_PATH=/app/data/aegis.db
+      - AEGIS_API_URL=http://localhost:8000
+      - AEGIS_SALT=hackathon-salt
+      - WINDOW_HOURS=24
+      - ALERT_THRESHOLD=0.40
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: aegis-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - AEGIS_API_URL=http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+
+  simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.simulator
+    container_name: aegis-simulator
+    profiles:
+      - demo
+    environment:
+      - AEGIS_API_URL=http://api:8000
+      - AEGIS_SALT=hackathon-salt
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "simulator.main", "stream", "--api-url", "http://api:8000", "--rate", "5", "--duration", "180"]
