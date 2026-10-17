@@ -27,6 +27,14 @@ from app.alerts_store import (
     write_audit,
 )
 from app.auth import authenticated_role
+from app.models import (
+    AlertDetail,
+    AlertSummary,
+    AuditRecord,
+    DecisionResponse,
+    GraphResponse,
+    StatsResponse,
+)
 from app.masking import (
     mask_alert_detail,
     mask_alert_summary,
@@ -38,10 +46,18 @@ router = APIRouter(prefix="/v1")
 
 
 class DecisionRequest(BaseModel):
+    """Atomic alert decision; authenticated role is always the attribution source."""
+
     decision: Literal["APPROVE", "DISMISS"]
     # Retained for request compatibility; never used as authenticated identity.
     analyst: str = Field(default="", description="Deprecated display field; attribution comes from bearer role")
     note: str = Field(default="", description="Optional analyst investigation notes")
+
+    model_config = {"json_schema_extra": {"examples": [{
+        "decision": "APPROVE",
+        "analyst": "",  # Deprecated and ignored for identity.
+        "note": "Reviewed the transaction pattern.",
+    }]}}
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +65,14 @@ class DecisionRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@router.get("/alerts")
+@router.get(
+    "/alerts",
+    response_model=list[AlertSummary],
+    summary="List alerts",
+    description="ANALYST and SENIOR_ANALYST. Account tokens and transaction IDs are masked unless a senior bearer token is used with unmask=true.",
+    responses={400: {"description": "Unsupported alert status filter."}, 401: {"description": "Missing or invalid bearer credential."}, 422: {"description": "Invalid query parameter."}},
+    tags=["alerts"],
+)
 def get_alerts_endpoint(
     status: str | None = Query(None, description="Filter by status: OPEN, APPROVED, DISMISSED"),
     limit: int = Query(100, ge=1, le=1000, description="Max alerts to return"),
@@ -74,7 +97,14 @@ def get_alerts_endpoint(
     return [mask_alert_summary(a, unmask=unmask, role=role) for a in alerts]
 
 
-@router.get("/alerts/{alert_id}")
+@router.get(
+    "/alerts/{alert_id}",
+    response_model=AlertDetail,
+    summary="Get alert details",
+    description="ANALYST and SENIOR_ANALYST. Includes features, decisions, and alert audit trail; identifiers remain masked by default.",
+    responses={401: {"description": "Missing or invalid bearer credential."}, 404: {"description": "Alert not found."}, 422: {"description": "Invalid alert ID or query parameter."}},
+    tags=["alerts"],
+)
 def get_alert_detail_endpoint(
     alert_id: int,
     unmask: bool = Query(False, description="Unmask account tokens (requires SENIOR_ANALYST)"),
@@ -97,7 +127,14 @@ def get_alert_detail_endpoint(
     return mask_alert_detail(alert, unmask=unmask, role=role)
 
 
-@router.post("/alerts/{alert_id}/decision")
+@router.post(
+    "/alerts/{alert_id}/decision",
+    response_model=DecisionResponse,
+    summary="Record an alert decision",
+    description="ANALYST and SENIOR_ANALYST. Decision, alert status transition, and audit record commit atomically. Caller-supplied analyst is ignored for attribution.",
+    responses={400: {"description": "Invalid decision value."}, 401: {"description": "Missing or invalid bearer credential."}, 404: {"description": "Alert not found."}, 409: {"description": "Alert has already been decided."}, 422: {"description": "Invalid request body."}},
+    tags=["alerts"],
+)
 def post_decision_endpoint(
     alert_id: int,
     payload: DecisionRequest,
@@ -131,7 +168,14 @@ def post_decision_endpoint(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
-@router.get("/alerts/{alert_id}/graph")
+@router.get(
+    "/alerts/{alert_id}/graph",
+    response_model=GraphResponse,
+    summary="Get an alert graph neighborhood",
+    description="ANALYST and SENIOR_ANALYST. Returns the real graph-engine neighborhood for the alert sender; no synthetic fallback edges are added.",
+    responses={401: {"description": "Missing or invalid bearer credential."}, 404: {"description": "Alert not found."}, 422: {"description": "Hops must be between 1 and 3."}, 503: {"description": "Graph engine unavailable or query failed."}},
+    tags=["graph"],
+)
 def get_alert_graph_endpoint(
     alert_id: int,
     request: Request,
@@ -150,32 +194,15 @@ def get_alert_graph_endpoint(
     raw_sender = str(alert.get("sender_token", ""))
     raw_receiver = str(alert.get("receiver_token", ""))
 
-    # Query graph engine from request.app.state if available (Part 2)
-    graph: dict[str, Any] | None = None
+    # Return only graph data from the running engine; do not fabricate edges
+    # from alert fields when the neighborhood is empty or unavailable.
     engine = getattr(request.app.state, "engine", None)
-    if engine is not None and hasattr(engine, "neighborhood"):
-        try:
-            graph = engine.neighborhood(raw_sender, hops=hops)
-        except Exception:
-            graph = None
-
-    # Graceful fallback graph if engine is not running or neighborhood empty
-    if not graph or not graph.get("nodes"):
-        graph = {
-            "nodes": [
-                {"id": raw_sender, "in_degree": 0, "out_degree": 1},
-                {"id": raw_receiver, "in_degree": 1, "out_degree": 0},
-            ],
-            "edges": [
-                {
-                    "source": raw_sender,
-                    "target": raw_receiver,
-                    "amount": alert.get("amount", 0.0),
-                    "timestamp": alert.get("created_at", ""),
-                    "txn_id": alert.get("txn_id", ""),
-                }
-            ],
-        }
+    if engine is None or not hasattr(engine, "neighborhood"):
+        raise HTTPException(status_code=503, detail="Graph engine is unavailable.")
+    try:
+        graph = engine.neighborhood(raw_sender, hops=hops)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Graph neighborhood query failed.") from exc
 
     if should_unmask(role, unmask):
         write_audit(
@@ -195,7 +222,14 @@ def get_alert_graph_endpoint(
     )
 
 
-@router.get("/graph/neighborhood/{token}")
+@router.get(
+    "/graph/neighborhood/{token}",
+    response_model=GraphResponse,
+    summary="Get a token neighborhood",
+    description="ANALYST and SENIOR_ANALYST. Returns up to three graph hops with identifiers masked by default.",
+    responses={401: {"description": "Missing or invalid bearer credential."}, 422: {"description": "Hops must be between 1 and 3."}, 503: {"description": "Graph engine unavailable or query failed."}},
+    tags=["graph"],
+)
 def get_graph_neighborhood_endpoint(
     token: str,
     request: Request,
@@ -207,7 +241,10 @@ def get_graph_neighborhood_endpoint(
     engine = getattr(request.app.state, "engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="Graph engine is unavailable.")
-    graph = engine.neighborhood(token, hops=hops)
+    try:
+        graph = engine.neighborhood(token, hops=hops)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Graph neighborhood query failed.") from exc
     if should_unmask(role, unmask):
         write_audit(actor=role, role=role, action="UNMASK", target="graph_neighborhood",
                     detail={"hops": hops})
@@ -219,13 +256,27 @@ def get_graph_neighborhood_endpoint(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/stats")
+@router.get(
+    "/stats",
+    response_model=StatsResponse,
+    summary="Get platform statistics",
+    description="ANALYST and SENIOR_ANALYST. Returns persisted transaction and alert counts plus mean processing latency.",
+    responses={401: {"description": "Missing or invalid bearer credential."}},
+    tags=["statistics"],
+)
 def get_stats_endpoint(role: str = Depends(authenticated_role)) -> dict[str, Any]:
     """Return platform statistics for the analyst dashboard."""
     return get_stats()
 
 
-@router.get("/audit")
+@router.get(
+    "/audit",
+    response_model=list[AuditRecord],
+    summary="Get audit history",
+    description="SENIOR_ANALYST only. Analysts receive HTTP 403. Every request also requires a valid senior bearer credential.",
+    responses={401: {"description": "Missing or invalid bearer credential."}, 403: {"description": "Authenticated analyst lacks senior-role access."}, 422: {"description": "Invalid limit."}},
+    tags=["audit"],
+)
 def get_audit_endpoint(
     limit: int = Query(200, ge=1, le=1000, description="Max audit entries to return"),
     role: str = Depends(authenticated_role),

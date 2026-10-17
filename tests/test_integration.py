@@ -178,7 +178,9 @@ def test_retry_recovers_legacy_partial_transaction_alert(client, monkeypatch):
     assert recovered.json()["alert_id"] is not None
     duplicate = client.post("/v1/transactions", json=payload)
     assert duplicate.json() == recovered.json()
-    assert len([alert for alert in client.get("/v1/alerts?limit=1000").json() if alert["txn_id"] == payload["txn_id"]]) == 1
+    expected_masked_txn_id = payload["txn_id"][:4] + "..."
+    assert len([alert for alert in client.get("/v1/alerts?limit=1000").json()
+                if alert["txn_id"] == expected_masked_txn_id]) == 1
 
 
 def test_concurrent_duplicate_ingestion_creates_one_transaction_and_alert(client, monkeypatch):
@@ -202,6 +204,8 @@ def test_authentication_and_stats_authorization(client):
     assert client.get("/v1/audit", headers={"X-Role": "SENIOR_ANALYST"}).status_code == 401
     assert client.get("/v1/audit", headers={"X-Role": "SENIOR_ANALYST", "Authorization": "Bearer invalid"}).status_code == 401
     assert client.get("/v1/audit").status_code == 403
+    assert client.get("/v1/stats", headers={"X-Role": "SENIOR_ANALYST", "Authorization": "Bearer integration-senior"}).status_code == 200
+    assert client.get("/v1/alerts", headers={"X-Role": "SENIOR_ANALYST", "Authorization": "Bearer integration-senior"}).status_code == 200
     assert client.get("/v1/audit", headers={"X-Role": "SENIOR_ANALYST", "Authorization": "Bearer integration-senior"}).status_code == 200
 
 

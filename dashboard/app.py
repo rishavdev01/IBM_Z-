@@ -6,7 +6,7 @@ Features:
 - Filterable and searchable Fraud Alert Queue (/v1/alerts).
 - Deep-dive alert investigation panel:
   - Transaction facts and risk score gauge (Plotly).
-  - Explainable ML risk factors.
+  - Explainable scorer reasons.
   - Interactive transfer neighborhood graph (PyVis).
   - Analyst decision actions (APPROVE / DISMISS).
 - RBAC role selection and privacy unmasking with audit trail (/v1/audit).
@@ -43,6 +43,14 @@ except ImportError:
 # API Client Helpers
 # ---------------------------------------------------------------------------
 
+def mask_identifier(value: str | None) -> str:
+    """Mask a sensitive identifier for the dashboard's default analyst view."""
+    if not value:
+        return ""
+    value = str(value).strip()
+    return value if len(value) <= 4 else value[:4] + "..."
+
+
 def role_for_token(token: str) -> str | None:
     """Resolve a user-supplied bearer token to a configured role."""
     if token and os.getenv("AEGIS_ANALYST_TOKEN") and hmac.compare_digest(token, os.environ["AEGIS_ANALYST_TOKEN"]):
@@ -54,9 +62,12 @@ def role_for_token(token: str) -> str | None:
 
 def get_api_client(base_url: str, role: str, token: str = "") -> httpx.Client:
     """Return an HTTPX client using the credential entered by the dashboard user."""
+    headers = {"X-Role": role, "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     return httpx.Client(
         base_url=base_url.rstrip("/"),
-        headers={"X-Role": role, "Authorization": f"Bearer {token}", "Accept": "application/json"},
+        headers=headers,
         timeout=10.0,
     )
 
@@ -76,11 +87,31 @@ def _set_api_error(name: str, message: str | None) -> None:
         return
 
 
-def _show_api_errors() -> None:
+def _show_api_errors(name: str) -> None:
     """Render current API failures in the dashboard."""
     errors = st.session_state.get("_api_errors", {})
-    for name, message in errors.items():
-        st.error(f"{name} unavailable: {message}")
+    if name in errors:
+        st.error(f"{name} unavailable: {errors[name]}")
+
+
+def _http_error(status_code: int) -> str:
+    """Provide a useful auth hint while preserving the actual HTTP status."""
+    if status_code == 401:
+        return "HTTP 401: the supplied credential was rejected"
+    if status_code == 403:
+        return "HTTP 403: this role is not permitted to access the resource"
+    return f"HTTP {status_code}"
+
+
+def _exception_message(error: Exception) -> str:
+    """Describe common transport failures without exposing request headers or URLs."""
+    if isinstance(error, httpx.TimeoutException):
+        return "request timed out"
+    if isinstance(error, httpx.ConnectError):
+        return "could not connect to the API"
+    if isinstance(error, httpx.LocalProtocolError):
+        return "invalid local HTTP request (check the API URL and request headers)"
+    return type(error).__name__
 
 
 def check_api_health(client: Any) -> tuple[bool, str]:
@@ -90,24 +121,60 @@ def check_api_health(client: Any) -> tuple[bool, str]:
         if r.status_code == 200 and r.json().get("status") == "ok":
             _set_api_error("API health", None)
             return True, "Connected"
-        _set_api_error("API health", f"HTTP {r.status_code}")
-        return False, f"HTTP {r.status_code}"
+        message = _http_error(r.status_code)
+        _set_api_error("API health", message)
+        return False, message
     except Exception as e:
-        _set_api_error("API health", type(e).__name__)
-        return False, f"Offline ({type(e).__name__})"
+        message = _exception_message(e)
+        _set_api_error("API health", message)
+        return False, f"Offline ({message})"
 
 
-def fetch_stats(client: Any) -> dict[str, Any]:
-    """Fetch KPI metrics from /v1/stats."""
+def _fetch_stats_response(client: Any) -> tuple[dict[str, Any] | None, int | None]:
+    """Fetch KPI metrics and retain the HTTP status for authentication handling."""
     try:
         r = client.get("/v1/stats")
         if r.status_code == 200:
             _set_api_error("Statistics", None)
-            return r.json()
-        _set_api_error("Statistics", f"HTTP {r.status_code}")
+            return r.json(), r.status_code
+        _set_api_error("Statistics", _http_error(r.status_code))
+        return None, r.status_code
     except Exception as e:
-        _set_api_error("Statistics", type(e).__name__)
-    return {"total_txns": 0, "alerts_open": 0, "alerts_total": 0, "avg_latency_ms": 0.0}
+        _set_api_error("Statistics", _exception_message(e))
+        return None, None
+
+
+def fetch_stats(client: Any) -> dict[str, Any] | None:
+    """Fetch KPI metrics from /v1/stats."""
+    return _fetch_stats_response(client)[0]
+
+
+def load_dashboard_stats(
+    client: Any,
+    *,
+    api_reachable: bool,
+    token: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Fetch protected statistics only when reachable and a credential is present."""
+    if not api_reachable:
+        _set_api_error("Statistics", None)
+        _set_api_error("Alerts", None)
+        _set_api_error("Audit log", None)
+        return None, "offline"
+    if not token.strip():
+        _set_api_error("Statistics", None)
+        _set_api_error("Alerts", None)
+        _set_api_error("Audit log", None)
+        return None, "missing_credentials"
+
+    stats, status_code = _fetch_stats_response(client)
+    if status_code == 401:
+        # Suppress duplicate per-panel 401s; the dashboard renders one auth state.
+        _set_api_error("Statistics", None)
+        _set_api_error("Alerts", None)
+        _set_api_error("Audit log", None)
+        return None, "invalid_credentials"
+    return stats, "authenticated" if status_code == 200 else "request_error"
 
 
 def fetch_alerts(
@@ -115,7 +182,7 @@ def fetch_alerts(
     status: str | None = None,
     unmask: bool = False,
     limit: int = 100,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     """Fetch alerts queue from /v1/alerts."""
     params: dict[str, Any] = {"limit": limit, "unmask": str(unmask).lower()}
     if status and status != "ALL":
@@ -125,10 +192,10 @@ def fetch_alerts(
         if r.status_code == 200:
             _set_api_error("Alerts", None)
             return r.json()
-        _set_api_error("Alerts", f"HTTP {r.status_code}")
+        _set_api_error("Alerts", _http_error(r.status_code))
     except Exception as e:
-        _set_api_error("Alerts", type(e).__name__)
-    return []
+        _set_api_error("Alerts", _exception_message(e))
+    return None
 
 
 def fetch_alert_detail(
@@ -142,9 +209,9 @@ def fetch_alert_detail(
         if r.status_code == 200:
             _set_api_error("Alert detail", None)
             return r.json()
-        _set_api_error("Alert detail", f"HTTP {r.status_code}")
+        _set_api_error("Alert detail", _http_error(r.status_code))
     except Exception as e:
-        _set_api_error("Alert detail", type(e).__name__)
+        _set_api_error("Alert detail", _exception_message(e))
     return None
 
 
@@ -163,9 +230,9 @@ def fetch_alert_graph(
         if r.status_code == 200:
             _set_api_error("Alert graph", None)
             return r.json()
-        _set_api_error("Alert graph", f"HTTP {r.status_code}")
+        _set_api_error("Alert graph", _http_error(r.status_code))
     except Exception as e:
-        _set_api_error("Alert graph", type(e).__name__)
+        _set_api_error("Alert graph", _exception_message(e))
     return None
 
 
@@ -185,11 +252,13 @@ def submit_decision(
         if r.status_code == 200:
             _set_api_error("Decision", None)
             return True, f"Decision {decision} recorded successfully."
-        _set_api_error("Decision", f"HTTP {r.status_code}")
-        return False, f"Failed: HTTP {r.status_code} - {r.text}"
+        message = _http_error(r.status_code)
+        _set_api_error("Decision", message)
+        return False, f"Failed: {message}"
     except Exception as e:
-        _set_api_error("Decision", type(e).__name__)
-        return False, f"Error submitting decision: {e}"
+        message = _exception_message(e)
+        _set_api_error("Decision", message)
+        return False, f"Error submitting decision: {message}"
 
 
 def fetch_audit_logs(client: Any, limit: int = 200) -> tuple[int, list[dict[str, Any]]]:
@@ -199,10 +268,12 @@ def fetch_audit_logs(client: Any, limit: int = 200) -> tuple[int, list[dict[str,
         if r.status_code == 200:
             _set_api_error("Audit log", None)
             return 200, r.json()
-        _set_api_error("Audit log", f"HTTP {r.status_code}")
+        # A 403 is an expected analyst-role restriction, shown as a friendly
+        # access message in the audit tab rather than a generic API failure.
+        _set_api_error("Audit log", None if r.status_code == 403 else _http_error(r.status_code))
         return r.status_code, []
     except Exception as e:
-        _set_api_error("Audit log", type(e).__name__)
+        _set_api_error("Audit log", _exception_message(e))
         return 500, []
 
 
@@ -363,26 +434,45 @@ def run_dashboard():
         client = get_api_client(api_url, role, access_token)
         is_healthy, health_msg = check_api_health(client)
 
-        st.markdown("### System Health")
+        st.markdown("### API Reachability")
         if is_healthy:
-            st.success(f"● API {health_msg}")
+            st.success("● API Reachable")
         else:
-            st.error(f"● API {health_msg}")
-        _show_api_errors()
-
+            st.error(f"● API Offline ({health_msg})")
         st.caption("IBM LinuxONE Architecture: `s390x`")
 
     st.title("Aegis Exchange — Real-Time Payment Fraud Detection")
-    st.caption("High-throughput streaming graph features, LightGBM explainability, and privacy-first analyst workflows.")
+    st.caption("Streaming graph features, transparent rule-based risk scoring, and privacy-first analyst workflows.")
 
-    # KPI Statistics Banner
-    stats = fetch_stats(client)
-    _show_api_errors()
+    # KPI Statistics Banner. Health is public reachability; these data require a bearer token.
+    stats, access_state = load_dashboard_stats(
+        client,
+        api_reachable=is_healthy,
+        token=access_token,
+    )
+    if access_state == "missing_credentials":
+        st.info("API is reachable. Enter the configured local analyst credential to load statistics and alerts.")
+    elif access_state == "offline" and not access_token.strip():
+        st.info("No credential is entered. Add the configured local analyst credential after the API is reachable.")
+    elif access_state == "invalid_credentials":
+        st.error("Authentication failed (HTTP 401). Enter a valid configured analyst or senior-role credential.")
+    elif access_state == "offline":
+        st.info("Protected data is unavailable while the API is offline. No cached data is being shown.")
+    else:
+        _show_api_errors("Statistics")
+        if access_state == "authenticated":
+            st.caption(f"Credentials accepted for {role.replace('_', ' ').lower()} access.")
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Transactions Processed", f"{stats.get('total_txns', 0):,}")
-    k2.metric("Open Alerts", f"{stats.get('alerts_open', 0):,}")
-    k3.metric("Total Alerts", f"{stats.get('alerts_total', 0):,}")
-    k4.metric("Avg Latency", f"{stats.get('avg_latency_ms', 0.0):.1f} ms")
+    if stats is None:
+        k1.metric("Transactions Processed", "—")
+        k2.metric("Open Alerts", "—")
+        k3.metric("Total Alerts", "—")
+        k4.metric("Avg Latency", "—")
+    else:
+        k1.metric("Transactions Processed", f"{stats['total_txns']:,}")
+        k2.metric("Open Alerts", f"{stats['alerts_open']:,}")
+        k3.metric("Total Alerts", f"{stats['alerts_total']:,}")
+        k4.metric("Avg Latency", f"{stats['avg_latency_ms']:.1f} ms")
 
     st.divider()
 
@@ -393,10 +483,23 @@ def run_dashboard():
         with col_filter:
             status_filter = st.selectbox("Filter Status", ["ALL", "OPEN", "APPROVED", "DISMISSED"], index=1)
 
-        alerts = fetch_alerts(client, status=status_filter, unmask=unmask, limit=100)
-        _show_api_errors()
+        if access_state == "authenticated" or access_state == "request_error":
+            alerts = fetch_alerts(client, status=status_filter, unmask=unmask, limit=100)
+        else:
+            alerts = None
+        if access_state == "authenticated" or access_state == "request_error":
+            _show_api_errors("Alerts")
 
-        if not alerts:
+        if alerts is None:
+            if access_state == "missing_credentials":
+                st.info("Enter the configured local analyst credential to retrieve alerts.")
+            elif access_state == "invalid_credentials":
+                st.info("Alerts are unavailable until authentication succeeds.")
+            elif access_state == "offline":
+                st.info("Alerts are unavailable while the API is offline. No cached results are shown.")
+            else:
+                st.info("Alert list is unavailable; see the API error above.")
+        elif not alerts:
             st.info("No alerts found matching the current filter criteria.")
         else:
             df_display = pd.DataFrame(alerts)[
@@ -428,6 +531,7 @@ def run_dashboard():
 
             if selected_id:
                 alert_detail = fetch_alert_detail(client, selected_id, unmask=unmask)
+                _show_api_errors("Alert detail")
                 if alert_detail:
                     st.subheader(f"🔍 Investigation: Alert #{selected_id}")
 
@@ -435,7 +539,10 @@ def run_dashboard():
 
                     with col_facts:
                         st.markdown("#### Transaction Facts")
-                        st.write(f"**Transaction ID:** `{alert_detail.get('txn_id')}`")
+                        transaction_id = alert_detail.get("txn_id", "")
+                        if not unmask:
+                            transaction_id = mask_identifier(transaction_id)
+                        st.write(f"**Transaction ID:** `{transaction_id}`")
                         st.write(f"**Amount:** ₹{alert_detail.get('amount', 0.0):,.2f}")
                         st.write(f"**Sender Token:** `{alert_detail.get('sender_token')}`")
                         st.write(f"**Receiver Token:** `{alert_detail.get('receiver_token')}`")
@@ -462,11 +569,12 @@ def run_dashboard():
                                     unsafe_allow_html=True,
                                 )
                         else:
-                            st.info("No specific risk explanations provided by ML model.")
+                            st.info("The active scorer did not return factor explanations.")
 
                     st.markdown("#### Transfer Neighborhood Graph (2-Hop)")
                     st.caption("🔴 Red: Alert Sender | 🟠 Orange: Alert Receiver | 🔵 Blue: Intermediary Accounts")
                     graph_data = fetch_alert_graph(client, selected_id, hops=2, unmask=unmask)
+                    _show_api_errors("Alert graph")
                     if graph_data:
                         render_graph_network(graph_data, height=360)
 
@@ -508,13 +616,20 @@ def run_dashboard():
         st.subheader("Immutable Audit Trail")
         st.caption("Tracks all decisions, exports, and authorized unmask operations. Restricted to SENIOR_ANALYST.")
 
-        status_code, audit_logs = fetch_audit_logs(client, limit=200)
+        if access_state == "missing_credentials":
+            st.info("Enter the configured senior-role credential to view audit history.")
+            status_code, audit_logs = None, []
+        elif access_state == "offline":
+            st.info("Audit history is unavailable while the API is offline. No cached results are shown.")
+            status_code, audit_logs = None, []
+        elif access_state == "invalid_credentials":
+            st.info("Audit history is unavailable until authentication succeeds.")
+            status_code, audit_logs = None, []
+        else:
+            status_code, audit_logs = fetch_audit_logs(client, limit=200)
 
         if status_code == 403:
-            st.warning(
-                "🔒 **Access Restricted:** Viewing audit logs requires the `SENIOR_ANALYST` role.\n\n"
-                "To access this tab, switch your role to **SENIOR_ANALYST** in the sidebar."
-            )
+            st.warning("🔒 Audit history requires senior-role access.")
         elif status_code == 200 and audit_logs:
             df_audit = pd.DataFrame(audit_logs)[["id", "ts", "actor", "role", "action", "target", "detail"]]
             df_audit["detail"] = df_audit["detail"].apply(lambda d: str(d))
@@ -532,8 +647,11 @@ def run_dashboard():
                 use_container_width=True,
                 hide_index=True,
             )
-        else:
+        elif status_code == 200:
             st.info("No audit log records found.")
+        elif status_code is not None:
+            error = st.session_state.get("_api_errors", {}).get("Audit log", _http_error(status_code))
+            st.error(f"Audit history unavailable: {error}.")
 
     if auto_refresh:
         time.sleep(3)

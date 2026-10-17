@@ -29,5 +29,3 @@ def process_transaction(txn: dict[str, Any], engine: GraphEngine) -> dict[str, A
     processing_ms = (perf_counter() - started) * 1000
     response, alert_id = persist_transaction_result(txn, features, result, threshold, processing_ms)
     return {**response, "alert_id": alert_id}
-
-\n

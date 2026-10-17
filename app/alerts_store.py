@@ -181,8 +181,12 @@ def list_recent_transactions(since: str, limit: int = 500_000, factory: sessionm
     """Return recent transaction graph inputs in timestamp order for warm startup."""
     session = _get_session(factory)
     try:
-        rows = session.scalars(select(TransactionRow).order_by(TransactionRow.timestamp.desc(), TransactionRow.txn_id.desc())
-                               .limit(limit)).all()
+        rows = session.scalars(
+            select(TransactionRow)
+            .where(TransactionRow.timestamp >= since)
+            .order_by(TransactionRow.timestamp.desc(), TransactionRow.txn_id.desc())
+            .limit(limit)
+        ).all()
         cutoff = datetime.fromisoformat(since.replace("Z", "+00:00"))
         def included(row: TransactionRow) -> bool:
             moment = datetime.fromisoformat(row.timestamp.replace("Z", "+00:00"))
