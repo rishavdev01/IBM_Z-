@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Env and secrets
+.env
+.env.local
+
+# Data (keep folder via .gitkeep)
+data/*.db
+data/*.csv
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Logs / OS
+*.log
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+
+# Note: aegis_ml/model/*.joblib is NOT ignored — trained model files are committed.

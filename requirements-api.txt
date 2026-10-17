@@ -1,0 +1,14 @@
+# Parts 2 and 3 append lines only. Pin versions for LinuxONE (s390x) builds.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.5
+networkx==3.4.2
+scikit-learn==1.5.2
+lightgbm==4.5.0
+joblib==1.4.2
+numpy==1.26.4
+pandas==2.2.3
+sqlalchemy==2.0.36
+httpx==0.28.1
+pytest==8.3.4
+python-dotenv==1.0.1
