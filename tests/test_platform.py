@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -456,6 +457,7 @@ def test_should_unmask():
 def test_mask_alert_summary_and_detail():
     raw_alert = {
         "alert_id": 1,
+        "txn_id": "12345678-1234-4234-8234-123456789abc",
         "sender_token": "send_112233445566",
         "receiver_token": "recv_998877665544",
         "amount": 5000.0,
@@ -465,6 +467,7 @@ def test_mask_alert_summary_and_detail():
     masked = mask_alert_summary(raw_alert, unmask=False, role="ANALYST")
     assert masked["sender_token"] == "send..."
     assert masked["receiver_token"] == "recv..."
+    assert masked["txn_id"] == "1234..."
 
     # Analyst attempting unmask: still masked
     unauthorized = mask_alert_summary(raw_alert, unmask=True, role="ANALYST")
@@ -474,6 +477,7 @@ def test_mask_alert_summary_and_detail():
     authorized = mask_alert_summary(raw_alert, unmask=True, role="SENIOR_ANALYST")
     assert authorized["sender_token"] == "send_112233445566"
     assert authorized["receiver_token"] == "recv_998877665544"
+    assert authorized["txn_id"] == raw_alert["txn_id"]
 
 
 def test_mask_graph_data():
@@ -484,7 +488,8 @@ def test_mask_graph_data():
             {"id": "other_3333", "in_degree": 1, "out_degree": 1},
         ],
         "edges": [
-            {"source": "sender_1111", "target": "receiver_2222", "amount": 100.0},
+            {"source": "sender_1111", "target": "receiver_2222", "amount": 100.0,
+             "txn_id": "12345678-1234-4234-8234-123456789abc"},
             {"source": "receiver_2222", "target": "other_3333", "amount": 95.0},
         ],
     }
@@ -509,6 +514,7 @@ def test_mask_graph_data():
     edge = masked_graph["edges"][0]
     assert edge["source"] == "send..."
     assert edge["target"] == "rece..."
+    assert edge["txn_id"] == "1234..."
 
 
 
@@ -539,6 +545,35 @@ def test_api_health(api_client):
     res = api_client.get("/health")
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}
+
+
+def test_api_root_is_informational_and_links_to_health_and_docs(api_client):
+    res = api_client.get("/")
+    assert res.status_code == 200
+    assert res.json() == {
+        "name": "Aegis Exchange",
+        "status": "ok",
+        "health": "/health",
+        "docs": "/docs",
+    }
+
+
+def test_alert_graph_reports_unavailable_engine_without_fabricating_data(api_client):
+    from app.alerts_store import create_alert
+
+    alert_id = create_alert(
+        {"txn_id": "graph-outage", "sender_token": "sender-token-0001", "receiver_token": "receiver-token-01", "amount": 10},
+        {},
+        {"risk_score": 0.8, "risk_level": "HIGH"},
+    )
+    engine = api_client.app.state.engine
+    api_client.app.state.engine = None
+    try:
+        response = api_client.get(f"/v1/alerts/{alert_id}/graph")
+    finally:
+        api_client.app.state.engine = engine
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Graph engine is unavailable."
 
 
 def test_api_alerts_endpoints_rbac_and_masking(api_client):
@@ -586,11 +621,15 @@ def test_api_alerts_endpoints_rbac_and_masking(api_client):
 def test_api_alert_detail_and_graph(api_client):
     txn = {
         "txn_id": "api-txn-2",
+        "timestamp": "2026-10-17T15:00:00Z",
         "sender_token": "sender_graph_1",
         "receiver_token": "receiver_graph_2",
         "amount": 7500.0,
+        "channel": "UPI",
+        "device_token": "device_graph_01",
     }
     alert_id = create_alert(txn, {"amount": 7500.0}, {"risk_score": 0.77, "risk_level": "HIGH"})
+    api_client.app.state.engine.extract_features(txn)
 
     # 404 for unknown alert
     assert api_client.get("/v1/alerts/99999").status_code == 404
@@ -602,6 +641,7 @@ def test_api_alert_detail_and_graph(api_client):
     det = r_detail.json()
     assert det["alert_id"] == alert_id
     assert det["sender_token"] == "send..."
+    assert det["txn_id"] == "api-..."
 
     # Graph
     r_graph = api_client.get(f"/v1/alerts/{alert_id}/graph?hops=2")
@@ -610,6 +650,7 @@ def test_api_alert_detail_and_graph(api_client):
     assert "nodes" in g and "edges" in g
     node_roles = {n["id"]: n["role"] for n in g["nodes"]}
     assert "send..." in node_roles and node_roles["send..."] == "sender"
+    assert g["edges"][0]["txn_id"] == "api-..."
 
     # Invalid hops parameter
     r_bad_hops = api_client.get(f"/v1/alerts/{alert_id}/graph?hops=5")
@@ -681,6 +722,147 @@ from dashboard.app import (
     get_api_client,
     submit_decision,
 )
+
+
+def test_dashboard_client_omits_bearer_header_when_token_is_empty():
+    client = get_api_client("http://127.0.0.1:8000", "ANALYST")
+    assert "authorization" not in client.headers
+    client.close()
+
+
+def test_load_dashboard_stats_skips_requests_without_credential_or_api():
+    from dashboard.app import load_dashboard_stats
+
+    class NoCallsClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path):
+            self.calls.append(path)
+            raise AssertionError("protected request should have been skipped")
+
+    client = NoCallsClient()
+    assert load_dashboard_stats(client, api_reachable=True, token="") == (None, "missing_credentials")
+    assert client.calls == []
+    assert load_dashboard_stats(client, api_reachable=False, token="entered") == (None, "offline")
+    assert client.calls == []
+
+
+def test_load_dashboard_stats_distinguishes_invalid_and_valid_credentials():
+    from dashboard.app import load_dashboard_stats
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def json(self):
+            return {"total_txns": 3, "alerts_open": 1, "alerts_total": 2, "avg_latency_ms": 1.5}
+
+    class Client:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.calls = []
+
+        def get(self, path):
+            self.calls.append(path)
+            return Response(self.status_code)
+
+    invalid = Client(401)
+    assert load_dashboard_stats(invalid, api_reachable=True, token="bad") == (None, "invalid_credentials")
+    assert invalid.calls == ["/v1/stats"]
+
+    valid = Client(200)
+    stats, state = load_dashboard_stats(valid, api_reachable=True, token="configured")
+    assert state == "authenticated"
+    assert stats["total_txns"] == 3
+    assert valid.calls == ["/v1/stats"]
+
+
+def test_openapi_documents_bearer_security_and_public_routes():
+    from app.main import app
+
+    schema = app.openapi()
+    security = schema["components"]["securitySchemes"]["BearerAuth"]
+    assert security["type"] == "http"
+    assert security["scheme"] == "bearer"
+
+    protected = (
+        ("/v1/alerts", "get"),
+        ("/v1/alerts/{alert_id}", "get"),
+        ("/v1/alerts/{alert_id}/decision", "post"),
+        ("/v1/alerts/{alert_id}/graph", "get"),
+        ("/v1/graph/neighborhood/{token}", "get"),
+        ("/v1/stats", "get"),
+        ("/v1/audit", "get"),
+    )
+    for path, method in protected:
+        assert {"BearerAuth": []} in schema["paths"][path][method]["security"]
+
+    for path, method in (("/", "get"), ("/health", "get"), ("/v1/transactions", "post")):
+        assert "security" not in schema["paths"][path][method]
+    assert schema["paths"]["/v1/transactions"]["post"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].endswith("TransactionResponse")
+    assert "_truth" in schema["components"]["schemas"]["Transaction"]["properties"]
+
+
+def test_dashboard_masks_transaction_ids_by_default():
+    from dashboard.app import mask_identifier
+
+    assert mask_identifier("12345678-1234-4234-8234-123456789abc") == "1234..."
+    assert mask_identifier("") == ""
+
+
+def test_dashboard_distinguishes_unauthorized_from_empty_results():
+    from dashboard.app import fetch_alerts, fetch_stats
+
+    class UnauthorizedResponse:
+        status_code = 401
+
+    class UnauthorizedClient:
+        def get(self, *_args, **_kwargs):
+            return UnauthorizedResponse()
+
+    client = UnauthorizedClient()
+    assert fetch_stats(client) is None
+    assert fetch_alerts(client, status="OPEN") is None
+
+
+def test_graph_engine_contract_features_and_short_cycle():
+    from app.graph_engine import GraphEngine
+
+    engine = GraphEngine()
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def add(txn_id, sender, receiver, seconds, amount, device):
+        return engine.extract_features({
+            "txn_id": txn_id,
+            "timestamp": (start + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z"),
+            "sender_token": sender,
+            "receiver_token": receiver,
+            "amount": amount,
+            "channel": "UPI",
+            "device_token": device,
+        })
+
+    add("1", "a", "r", 0, 100, "da")
+    add("2", "a", "q", 1, 200, "da")
+    add("3", "b", "r", 2, 300, "db")
+    add("4", "r", "x", 4, 250, "dr")
+    fan_in = add("5", "c", "r", 5, 50, "dc")
+    assert fan_in["receiver_in_degree_24h"] == 2
+    assert fan_in["receiver_in_amount_24h"] == 400
+    assert fan_in["receiver_out_amount_24h"] == 250
+    assert fan_in["receiver_min_forward_seconds"] == 2
+    assert fan_in["sender_new_device"] == 1
+
+    sender_history = add("6", "a", "z", 6, 300, "da")
+    assert sender_history["sender_out_degree_24h"] == 2
+    assert sender_history["sender_txn_count_1h"] == 2
+    assert sender_history["amount_vs_sender_avg"] == 2
+
+    cycle = add("7", "x", "a", 7, 50, "dx")
+    assert cycle["in_cycle"] == 1
+    assert cycle["cycle_length"] == 3
+    assert cycle["sender_seconds_since_last_inbound"] == 3
 
 
 def test_dashboard_client_helpers(tmp_path, monkeypatch):

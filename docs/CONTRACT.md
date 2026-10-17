@@ -10,8 +10,10 @@ DATA FLOW:
 
 ```
 simulator --POST /v1/transactions--> FastAPI app
-FastAPI app -> app.graph_engine.extract_features(txn) -> app.scoring.score_features(features)
--> alerts_store.create_alert(...) (SQLite) -> dashboard reads GET /v1/alerts etc.
+FastAPI app -> app.pipeline.process_transaction(txn)
+-> app.graph_engine.GraphEngine.extract_features(txn) -> app.scoring.score_features(features)
+-> alerts_store.persist_transaction_result(...) (one SQLite transaction/alert commit)
+-> dashboard reads authenticated statistics and alert endpoints
 ```
 
 REPO LAYOUT (monorepo aegis-exchange):
@@ -29,7 +31,7 @@ requirements-api.txt          Parts 2 and 3 append lines only
 docker-compose.yml, Dockerfile.api, Dockerfile.dashboard, Dockerfile.simulator   PART 4
 ```
 
-ENV VARS: `AEGIS_SALT` is required in production and must be shared by the simulator/API; `AEGIS_DB_PATH=data/aegis.db`, `AEGIS_API_URL=http://localhost:8000`, `WINDOW_HOURS=24`, `ALERT_THRESHOLD=0.40`. Configure `AEGIS_ANALYST_TOKEN` and `AEGIS_SENIOR_ANALYST_TOKEN` outside source control. Never reuse the public demo salt for deployment.
+ENV VARS: `AEGIS_SALT` is required in production and must be shared by the simulator/API; `AEGIS_DB_PATH=data/aegis.db`, `AEGIS_API_URL=http://localhost:8000`, `WINDOW_HOURS=24`, `ALERT_THRESHOLD=0.40`. Configure `AEGIS_ANALYST_TOKEN` and `AEGIS_SENIOR_ANALYST_TOKEN` outside source control and configure the matching role tokens in the dashboard environment. Never reuse the public demo salt for deployment. Docker Compose defaults to API port 8000 and dashboard port 8501; local development may bind other explicitly selected ports when these are occupied.
 
 The repository does not contain a trained Part 3 model. The API-owned adapter defaults to an explainable feature-based rules backend (`AEGIS_SCORER_MODE=rules`). Setting `AEGIS_SCORER_MODE=ml` invokes the `aegis_ml.scorer.score(features)` interface when a real implementation is supplied. Rule scores are heuristic triage, not model predictions.
 
@@ -45,9 +47,10 @@ TRANSACTION (JSON body of POST `/v1/transactions`):
 - `channel` str `UPI` | `IMPS` | `NEFT`
 - `device_token` str same tokenization rule applied to the device id
 - `memo` str optional
-- `_truth` obj optional, simulator only: `{"is_scam": bool, "typology": str}`
-  - typology is one of: `mule_fan_in`, `rapid_forwarding`, `circular_layering`, `account_takeover`, `none`.
-  - Scoring code must NEVER read `_truth`.
+  - `_truth` object optional, simulator/offline evaluation only: `{"is_scam": bool, "typology": str}`.
+  - `typology` is one of `mule_fan_in`, `rapid_forwarding`, `circular_layering`, `account_takeover`, `none`.
+  - The API retains supplied labels in the transaction table for offline evaluation. They are not returned in API responses and must never be included in scoring features or online predictions.
+  - `memo` is accepted for simulator compatibility but is not used for scoring or persisted.
 
 GRAPH FEATURES: `app.state.engine` (GraphEngine in `app/graph_engine.py`): `engine.extract_features(txn: dict) -> dict` computes the features, THEN adds the txn to the graph (one call per txn, in timestamp order). Exactly these 16 numeric keys:
 
@@ -95,17 +98,32 @@ record_txn(txn: dict, result: dict) -> None
 
 Stub versions of both exist from Step 0 so every part runs on day one.
 
-API ENDPOINTS (JSON; base `http://localhost:8000`):
+API ENDPOINTS (JSON; Compose base `http://localhost:8000`):
 
-- `GET  /health` -> `{"status": "ok"}`
-- `POST /v1/transactions` -> `{"txn_id", "risk_score", "risk_level", "reasons", "alert_id" (int|null)}`
-- `GET  /v1/alerts?status=OPEN|APPROVED|DISMISSED&limit=100` -> `[Alert]`
-- `GET  /v1/alerts/{alert_id}` -> Alert + features + audit trail
-- `POST /v1/alerts/{alert_id}/decision` body `{"decision": "APPROVE"|"DISMISS", "analyst": str, "note": str}`
-- `GET  /v1/graph/neighborhood/{token}?hops=2` -> `{"nodes": [{"id", "in_degree", "out_degree"}], "edges": [{"source", "target", "amount", "timestamp", "txn_id"}]}`
-- `GET  /v1/stats` -> `{"total_txns", "alerts_open", "alerts_total", "avg_latency_ms"}`
-- `GET  /v1/alerts/{alert_id}/graph?hops=2` -> neighborhood shape for the alert's sender, ids masked per RBAC, nodes carry role `sender|receiver|other` (Part 4; uses `request.app.state.engine`)
-- `GET  /v1/audit?limit=200` -> `[AuditEntry]` (SENIOR_ANALYST only, else 403) (Part 4)
+- `GET /` (public) -> `{"name", "status", "health", "docs"}`; links are relative paths.
+- `GET /health` (public) -> `{"status": "ok"}`. Liveness only; it does not check authentication or database readiness.
+- `GET /docs` and `GET /openapi.json` are the FastAPI documentation routes.
+- `POST /v1/transactions` (currently public; no bearer dependency) accepts `Transaction` and returns `TransactionResponse`: `{"txn_id", "risk_score", "risk_level", "reasons", "alert_id"}`. Reusing `txn_id` returns the persisted result without duplicating a transaction or alert. A newly scored transaction and any qualifying alert are committed atomically. A scorer or persistence failure does not return a success response.
+- `GET /v1/alerts?status=OPEN|APPROVED|DISMISSED&limit=100&unmask=false` (ANALYST or SENIOR_ANALYST) -> `[AlertSummary]`.
+- `GET /v1/alerts/{alert_id}?unmask=false` (ANALYST or SENIOR_ANALYST) -> `AlertDetail`, including features, decisions, and alert-targeted audit history.
+- `POST /v1/alerts/{alert_id}/decision` (ANALYST or SENIOR_ANALYST), body `DecisionRequest` (`decision` is `APPROVE` or `DISMISS`; `note` is optional) -> `DecisionResponse`. The legacy `analyst` body field is ignored for identity; the authenticated role is recorded. The state transition, decision row, and audit row are atomic. A second decision returns 409.
+- `GET /v1/graph/neighborhood/{token}?hops=2&unmask=false` (ANALYST or SENIOR_ANALYST) -> `GraphResponse`.
+- `GET /v1/alerts/{alert_id}/graph?hops=2&unmask=false` (ANALYST or SENIOR_ANALYST) -> the graph-engine neighborhood for the alert sender with `sender|receiver|other` node roles. Empty neighborhoods remain empty; unavailable/failed graph queries return 503.
+- `GET /v1/stats` (ANALYST or SENIOR_ANALYST) -> `StatsResponse`.
+- `GET /v1/audit?limit=200` (SENIOR_ANALYST only) -> `[AuditRecord]`; an authenticated analyst receives 403.
+
+AUTHORIZATION AND STATUS CODES:
+
+- FastAPI Swagger UI exposes HTTP Bearer authorization for protected operations. Supply a configured role token with `Authorization: Bearer <token>` and select the matching `X-Role` (`ANALYST` by default, or `SENIOR_ANALYST`). `X-Role` alone grants no access.
+- Public routes are `GET /`, `GET /health`, and `POST /v1/transactions`. All `/v1` alert, graph, statistics, decision, and audit routes require a valid bearer token. Audit history additionally checks for `SENIOR_ANALYST` and returns 403 to analysts.
+- `400`: invalid `X-Role`, invalid alert status, or a store-level decision value error.
+- `401`: missing or invalid bearer credentials on a protected route.
+- `403`: valid analyst credential requesting senior-only audit history.
+- `404`: requested alert does not exist.
+- `409`: an alert already has a decision.
+- `422`: malformed body, invalid transaction UUID4/UTC timestamp/token shape, or out-of-range query values.
+- `503`: production authentication is not configured, or a graph engine/query is unavailable.
+- `500`: unhandled processing or persistence failure. A failed ingestion must not be interpreted as a stored success.
 
 Alert = `{"alert_id", "txn_id", "created_at", "status", "risk_score", "risk_level", "reasons", "sender_token", "receiver_token", "amount"}`
 
@@ -118,7 +136,7 @@ AUTHENTICATION: The `X-Role` header only selects the requested role; it is never
 
 TOKENIZATION CONFIGURATION: `AEGIS_SALT` must be identical in simulator and API so the same account produces the same 16-character token. Changing it fragments graph continuity; existing pseudonyms cannot be converted without source identifiers. Do not use demo, test, repeated-character, sequence, or other predictable secrets in production. API container access logging is disabled because graph-neighborhood URLs contain account tokens; preserve that setting when overriding the Uvicorn command.
 
-Alert endpoints return tokens masked (first 4 chars + `"..."`) unless the authenticated role is `SENIOR_ANALYST` and the query has `unmask=true`; every authorized unmask is written to `audit_log`.
+Alert endpoints return account tokens and transaction IDs masked (first 4 characters + `"..."`) by default. Only `SENIOR_ANALYST` with `unmask=true` can reveal them; each authorized unmask request is written to `audit_log`. Graph node/account IDs and edge transaction IDs are also masked by default. The immediate transaction-ingestion response includes the caller-provided `txn_id` for idempotent client correlation.
 
 TOKEN ROTATION: tokenization is deterministic and persisted transaction/graph records contain only tokens, not original identifiers. Changing `AEGIS_SALT` changes tokens for new simulator data and fragments graph continuity. Existing tokens cannot be converted to a new salt without the original identifiers; coordinate a new-data boundary or perform an authorized re-tokenization while raw identifiers remain available.
 

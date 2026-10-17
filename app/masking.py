@@ -61,6 +61,7 @@ def mask_alert_summary(
     if not should_unmask(role, unmask):
         res["sender_token"] = mask_token(res.get("sender_token"))
         res["receiver_token"] = mask_token(res.get("receiver_token"))
+        res["txn_id"] = mask_token(res.get("txn_id"))
     return res
 
 
@@ -74,6 +75,7 @@ def mask_alert_detail(
     if not should_unmask(role, unmask):
         res["sender_token"] = mask_token(res.get("sender_token"))
         res["receiver_token"] = mask_token(res.get("receiver_token"))
+        res["txn_id"] = mask_token(res.get("txn_id"))
     return res
 
 
@@ -123,5 +125,7 @@ def mask_graph_data(
         target_raw = str(edge.get("target", ""))
         edge["source"] = _get_masked_id(source_raw)
         edge["target"] = _get_masked_id(target_raw)
+        if edge.get("txn_id"):
+            edge["txn_id"] = mask_token(str(edge["txn_id"]))
 
     return res

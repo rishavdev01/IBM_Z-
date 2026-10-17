@@ -43,39 +43,80 @@ class GraphEngine:
             existing = next((edge for edge in self._edges if edge["txn_id"] == str(txn["txn_id"])), None)
             if existing is not None:
                 return dict(existing["features"])
-            history = [edge for edge in self._edges if edge["_dt"] <= now]
-            outgoing = [e for e in history if e["sender"] == sender]
-            inbound_to_receiver = [e for e in history if e["receiver"] == receiver]
-            outbound_from_receiver = [e for e in history if e["sender"] == receiver]
-            inbound_to_sender = [e for e in history if e["receiver"] == sender]
-            receiver_in = sum(e["amount"] for e in inbound_to_receiver)
-            receiver_out = sum(e["amount"] for e in outbound_from_receiver)
-            sender_in = sum(e["amount"] for e in inbound_to_sender)
-            sender_avg = (sum(e["amount"] for e in outgoing) / len(outgoing)) if outgoing else 0.0
-            forward_gaps = [
-                (out["_dt"] - inc["_dt"]).total_seconds()
-                for inc in inbound_to_receiver
-                for out in outbound_from_receiver
-                if out["_dt"] >= inc["_dt"]
-            ]
-            prior_graph = nx.DiGraph()
-            prior_graph.add_edges_from((e["sender"], e["receiver"]) for e in history)
+            sender_out_degree: set[str] = set()
+            sender_txn_count_1h = 0
+            sender_out_amount = 0.0
+            prior_sender_count = 0
+            receiver_in_senders: set[str] = set()
+            receiver_in = receiver_out = sender_in = 0.0
+            inbound_to_receiver: list[datetime] = []
+            outbound_from_receiver: list[datetime] = []
+            inbound_to_sender: list[datetime] = []
+            seen_device = False
+            adjacency: dict[str, set[str]] = {}
+            for edge in self._edges:
+                if edge["_dt"] > now:
+                    continue
+                edge_sender, edge_receiver = edge["sender"], edge["receiver"]
+                edge_time, edge_amount = edge["_dt"], edge["amount"]
+                adjacency.setdefault(edge_sender, set()).add(edge_receiver)
+                if edge_sender == sender:
+                    sender_out_degree.add(edge_receiver)
+                    sender_out_amount += edge_amount
+                    prior_sender_count += 1
+                    sender_txn_count_1h += edge_time >= now - timedelta(hours=1)
+                    seen_device = seen_device or edge["device"] == device
+                if edge_receiver == receiver:
+                    receiver_in_senders.add(edge_sender)
+                    receiver_in += edge_amount
+                    inbound_to_receiver.append(edge_time)
+                if edge_sender == receiver:
+                    receiver_out += edge_amount
+                    outbound_from_receiver.append(edge_time)
+                if edge_receiver == sender:
+                    sender_in += edge_amount
+                    inbound_to_sender.append(edge_time)
+            # Average by prior transfer count, not distinct receiver count.
+            sender_avg = sender_out_amount / prior_sender_count if prior_sender_count else 0.0
+            forward_gaps: list[float] = []
+            inbound_to_receiver.sort()
+            outbound_from_receiver.sort()
+            next_outbound = 0
+            for inbound_time in inbound_to_receiver:
+                while next_outbound < len(outbound_from_receiver) and outbound_from_receiver[next_outbound] < inbound_time:
+                    next_outbound += 1
+                if next_outbound < len(outbound_from_receiver):
+                    forward_gaps.append((outbound_from_receiver[next_outbound] - inbound_time).total_seconds())
             cycle_length = 0
             if sender == receiver:
                 cycle_length = 1
-            elif receiver in prior_graph and sender in prior_graph and nx.has_path(prior_graph, receiver, sender):
-                path = nx.shortest_path(prior_graph, receiver, sender)
-                if len(path) <= 5:
-                    cycle_length = len(path)
-            last_inbound = max((e["_dt"] for e in inbound_to_sender), default=None)
-            seen_device = any(e["sender"] == sender and e["device"] == device for e in history)
+            else:
+                # Only paths with at most four edges qualify (path length <= 5 nodes).
+                frontier = [receiver]
+                visited = {receiver}
+                for depth in range(1, 5):
+                    next_frontier: list[str] = []
+                    for node in frontier:
+                        for neighbor in adjacency.get(node, ()):
+                            if neighbor == sender:
+                                cycle_length = depth + 1
+                                break
+                            if neighbor not in visited:
+                                visited.add(neighbor)
+                                next_frontier.append(neighbor)
+                        if cycle_length:
+                            break
+                    if cycle_length or not next_frontier:
+                        break
+                    frontier = next_frontier
+            last_inbound = max(inbound_to_sender, default=None)
             features = {
                 "amount": amount,
                 "hour_of_day": float(now.hour),
                 "channel_code": channel_codes.get(str(txn["channel"]), 0.0),
-                "sender_out_degree_24h": float(len({e["receiver"] for e in outgoing})),
-                "sender_txn_count_1h": float(sum(e["_dt"] >= now - timedelta(hours=1) for e in outgoing)),
-                "receiver_in_degree_24h": float(len({e["sender"] for e in inbound_to_receiver})),
+                "sender_out_degree_24h": float(len(sender_out_degree)),
+                "sender_txn_count_1h": float(sender_txn_count_1h),
+                "receiver_in_degree_24h": float(len(receiver_in_senders)),
                 "receiver_in_amount_24h": receiver_in,
                 "receiver_out_amount_24h": receiver_out,
                 "receiver_forward_ratio": receiver_out / receiver_in if receiver_in else 0.0,
@@ -83,7 +124,7 @@ class GraphEngine:
                 "in_cycle": float(bool(cycle_length)),
                 "cycle_length": float(cycle_length),
                 "sender_seconds_since_last_inbound": (now - last_inbound).total_seconds() if last_inbound else -1.0,
-                "sender_forward_ratio": (sum(e["amount"] for e in outgoing) + amount) / sender_in if sender_in else 0.0,
+                "sender_forward_ratio": (sender_out_amount + amount) / sender_in if sender_in else 0.0,
                 "sender_new_device": float(not seen_device),
                 "amount_vs_sender_avg": amount / sender_avg if sender_avg else 1.0,
             }
@@ -117,5 +158,3 @@ class GraphEngine:
                      for e in ({"source": e["sender"], "target": e["receiver"], **e} for e in self._edges)
                      if e["source"] in visited and e["target"] in visited]
             return {"nodes": nodes, "edges": edges}
-
-\n

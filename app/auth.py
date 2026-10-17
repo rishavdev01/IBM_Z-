@@ -10,10 +10,16 @@ import hmac
 import os
 import re
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 
 _WEAK_SECRET_VALUES = {"secret", "changeme", "change-me", "password", "default", "hackathon-salt", "integration-only-salt"}
+bearer_scheme = HTTPBearer(
+    auto_error=False,
+    scheme_name="BearerAuth",
+    description="Configured analyst or senior analyst bearer token. X-Role selects the role but does not authenticate it.",
+)
 
 
 def validate_production_secrets(environment: dict[str, str] | None = None) -> None:
@@ -39,7 +45,7 @@ def validate_production_secrets(environment: dict[str, str] | None = None) -> No
 
 
 def authenticated_role(
-    authorization: str | None = Header(None, alias="Authorization"),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     x_role: str | None = Header(None, alias="X-Role"),
 ) -> str:
     """Authenticate a configured role token and return its trusted role."""
@@ -52,9 +58,7 @@ def authenticated_role(
     }
     if os.getenv("AEGIS_ENV", "development").lower() == "production" and not all(configured.values()):
         raise HTTPException(status_code=503, detail="Analyst authentication is not configured.")
-    scheme, _, supplied = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not configured[role] or not hmac.compare_digest(supplied, configured[role]):
+    supplied = credentials.credentials if credentials is not None else ""
+    if credentials is None or not configured[role] or not hmac.compare_digest(supplied, configured[role]):
         raise HTTPException(status_code=401, detail="Valid bearer authentication is required.", headers={"WWW-Authenticate": "Bearer"})
     return role
-
-\n

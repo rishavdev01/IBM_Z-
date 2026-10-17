@@ -50,5 +50,3 @@ def score_features(features: dict[str, Any]) -> dict[str, Any]:
     if mode != "rules":
         raise ValueError("AEGIS_SCORER_MODE must be 'rules' or 'ml'")
     return rule_based_score(features)
-
-\n
