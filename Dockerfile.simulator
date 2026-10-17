@@ -27,4 +27,5 @@ COPY simulator/ /app/simulator/
 USER aegis
 
 # Default to streaming transactions at 5 txns/sec to API
+ENTRYPOINT ["sh", "-c", "test -n \"$AEGIS_SALT\" || { echo 'AEGIS_SALT is required' >&2; exit 1; }; exec \"$@\"", "--"]
 CMD ["python", "-m", "simulator.main", "stream", "--api-url", "http://api:8000", "--rate", "5", "--duration", "300"]

@@ -517,12 +517,15 @@ def api_client(tmp_path, monkeypatch):
     """FastAPI test client with an isolated temporary SQLite database."""
     test_db = tmp_path / "api_test.db"
     monkeypatch.setenv("AEGIS_DB_PATH", str(test_db))
+    monkeypatch.setenv("AEGIS_ANALYST_TOKEN", "test-analyst-secret")
+    monkeypatch.setenv("AEGIS_SENIOR_ANALYST_TOKEN", "test-senior-secret")
+    monkeypatch.setenv("AEGIS_ENV", "test")
     # Reset engine singleton to use test_db
     app_db._engine = None
     app_db._SessionLocal = None
     app_db.init_db()
 
-    with TestClient(app) as client:
+    with TestClient(app, headers={"X-Role": "ANALYST", "Authorization": "Bearer test-analyst-secret"}) as client:
         yield client
 
     # Cleanup engine
@@ -573,7 +576,7 @@ def test_api_alerts_endpoints_rbac_and_masking(api_client):
     assert r_unauthorized.json()[0]["sender_token"] == "send..."
 
     # 4. SENIOR_ANALYST with unmask=true: returns raw tokens and audits access
-    r_senior = api_client.get("/v1/alerts?unmask=true", headers={"X-Role": "SENIOR_ANALYST"})
+    r_senior = api_client.get("/v1/alerts?unmask=true", headers={"X-Role": "SENIOR_ANALYST", "Authorization": "Bearer test-senior-secret"})
     assert r_senior.status_code == 200
     senior_alert = [a for a in r_senior.json() if a["alert_id"] == alert_id][0]
     assert senior_alert["sender_token"] == "sender_secret_1"
@@ -645,7 +648,7 @@ def test_api_decision_flow_and_audit_rbac(api_client):
     assert r_audit_analyst.status_code == 403
 
     # SENIOR_ANALYST gets 200 OK
-    r_audit_senior = api_client.get("/v1/audit", headers={"X-Role": "SENIOR_ANALYST"})
+    r_audit_senior = api_client.get("/v1/audit", headers={"X-Role": "SENIOR_ANALYST", "Authorization": "Bearer test-senior-secret"})
     assert r_audit_senior.status_code == 200
     logs = r_audit_senior.json()
     assert len(logs) >= 1
@@ -681,6 +684,9 @@ from dashboard.app import (
 
 
 def test_dashboard_client_helpers(tmp_path, monkeypatch):
+    monkeypatch.setenv("AEGIS_ANALYST_TOKEN", "test-analyst-secret")
+    monkeypatch.setenv("AEGIS_SENIOR_ANALYST_TOKEN", "test-senior-secret")
+    monkeypatch.setenv("AEGIS_ENV", "test")
     test_db = tmp_path / "dash_test.db"
     monkeypatch.setenv("AEGIS_DB_PATH", str(test_db))
     app_db._engine = None
@@ -691,7 +697,7 @@ def test_dashboard_client_helpers(tmp_path, monkeypatch):
     txn = {"txn_id": "dash-txn", "sender_token": "dash_sender_1", "receiver_token": "dash_receiver_2", "amount": 8800.0}
     aid = create_alert(txn, {}, {"risk_score": 0.85, "risk_level": "HIGH"})
 
-    with TestClient(app, headers={"X-Role": "SENIOR_ANALYST"}) as client:
+    with TestClient(app, headers={"X-Role": "SENIOR_ANALYST", "Authorization": "Bearer test-senior-secret"}) as client:
         # Health check
         healthy, msg = check_api_health(client)
         assert healthy is True

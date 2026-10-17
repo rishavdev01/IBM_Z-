@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import time
+import hmac
 from typing import Any
 
 import httpx
@@ -42,13 +43,44 @@ except ImportError:
 # API Client Helpers
 # ---------------------------------------------------------------------------
 
-def get_api_client(base_url: str, role: str) -> httpx.Client:
-    """Return an HTTPX client configured with the given base URL and role header."""
+def role_for_token(token: str) -> str | None:
+    """Resolve a user-supplied bearer token to a configured role."""
+    if token and os.getenv("AEGIS_ANALYST_TOKEN") and hmac.compare_digest(token, os.environ["AEGIS_ANALYST_TOKEN"]):
+        return "ANALYST"
+    if token and os.getenv("AEGIS_SENIOR_ANALYST_TOKEN") and hmac.compare_digest(token, os.environ["AEGIS_SENIOR_ANALYST_TOKEN"]):
+        return "SENIOR_ANALYST"
+    return None
+
+
+def get_api_client(base_url: str, role: str, token: str = "") -> httpx.Client:
+    """Return an HTTPX client using the credential entered by the dashboard user."""
     return httpx.Client(
         base_url=base_url.rstrip("/"),
-        headers={"X-Role": role, "Accept": "application/json"},
+        headers={"X-Role": role, "Authorization": f"Bearer {token}", "Accept": "application/json"},
         timeout=10.0,
     )
+
+
+def _set_api_error(name: str, message: str | None) -> None:
+    """Store endpoint availability for display separately from empty results."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx(suppress_warning=True) is not None:
+            errors = dict(st.session_state.get("_api_errors", {}))
+            if message:
+                errors[name] = message
+            else:
+                errors.pop(name, None)
+            st.session_state["_api_errors"] = errors
+    except Exception:
+        return
+
+
+def _show_api_errors() -> None:
+    """Render current API failures in the dashboard."""
+    errors = st.session_state.get("_api_errors", {})
+    for name, message in errors.items():
+        st.error(f"{name} unavailable: {message}")
 
 
 def check_api_health(client: Any) -> tuple[bool, str]:
@@ -56,9 +88,12 @@ def check_api_health(client: Any) -> tuple[bool, str]:
     try:
         r = client.get("/health")
         if r.status_code == 200 and r.json().get("status") == "ok":
+            _set_api_error("API health", None)
             return True, "Connected"
+        _set_api_error("API health", f"HTTP {r.status_code}")
         return False, f"HTTP {r.status_code}"
     except Exception as e:
+        _set_api_error("API health", type(e).__name__)
         return False, f"Offline ({type(e).__name__})"
 
 
@@ -67,9 +102,11 @@ def fetch_stats(client: Any) -> dict[str, Any]:
     try:
         r = client.get("/v1/stats")
         if r.status_code == 200:
+            _set_api_error("Statistics", None)
             return r.json()
-    except Exception:
-        pass
+        _set_api_error("Statistics", f"HTTP {r.status_code}")
+    except Exception as e:
+        _set_api_error("Statistics", type(e).__name__)
     return {"total_txns": 0, "alerts_open": 0, "alerts_total": 0, "avg_latency_ms": 0.0}
 
 
@@ -86,9 +123,11 @@ def fetch_alerts(
     try:
         r = client.get("/v1/alerts", params=params)
         if r.status_code == 200:
+            _set_api_error("Alerts", None)
             return r.json()
-    except Exception:
-        pass
+        _set_api_error("Alerts", f"HTTP {r.status_code}")
+    except Exception as e:
+        _set_api_error("Alerts", type(e).__name__)
     return []
 
 
@@ -101,9 +140,11 @@ def fetch_alert_detail(
     try:
         r = client.get(f"/v1/alerts/{alert_id}", params={"unmask": str(unmask).lower()})
         if r.status_code == 200:
+            _set_api_error("Alert detail", None)
             return r.json()
-    except Exception:
-        pass
+        _set_api_error("Alert detail", f"HTTP {r.status_code}")
+    except Exception as e:
+        _set_api_error("Alert detail", type(e).__name__)
     return None
 
 
@@ -120,9 +161,11 @@ def fetch_alert_graph(
             params={"hops": hops, "unmask": str(unmask).lower()},
         )
         if r.status_code == 200:
+            _set_api_error("Alert graph", None)
             return r.json()
-    except Exception:
-        pass
+        _set_api_error("Alert graph", f"HTTP {r.status_code}")
+    except Exception as e:
+        _set_api_error("Alert graph", type(e).__name__)
     return None
 
 
@@ -137,12 +180,15 @@ def submit_decision(
     try:
         r = client.post(
             f"/v1/alerts/{alert_id}/decision",
-            json={"decision": decision, "analyst": analyst, "note": note},
+            json={"decision": decision, "note": note},
         )
         if r.status_code == 200:
+            _set_api_error("Decision", None)
             return True, f"Decision {decision} recorded successfully."
+        _set_api_error("Decision", f"HTTP {r.status_code}")
         return False, f"Failed: HTTP {r.status_code} - {r.text}"
     except Exception as e:
+        _set_api_error("Decision", type(e).__name__)
         return False, f"Error submitting decision: {e}"
 
 
@@ -151,9 +197,12 @@ def fetch_audit_logs(client: Any, limit: int = 200) -> tuple[int, list[dict[str,
     try:
         r = client.get("/v1/audit", params={"limit": limit})
         if r.status_code == 200:
+            _set_api_error("Audit log", None)
             return 200, r.json()
+        _set_api_error("Audit log", f"HTTP {r.status_code}")
         return r.status_code, []
-    except Exception:
+    except Exception as e:
+        _set_api_error("Audit log", type(e).__name__)
         return 500, []
 
 
@@ -291,20 +340,15 @@ def run_dashboard():
         st.divider()
 
         api_url = st.text_input("Backend API URL", value=default_api_url)
-        role = st.selectbox(
-            "RBAC Role (Demonstration)",
-            options=["ANALYST", "SENIOR_ANALYST"],
-            index=0,
-            help="Demonstration role header passed via X-Role.",
-        )
-        analyst_name = st.text_input("Analyst ID", value="analyst_alice")
+        access_token = st.text_input("Analyst access token", type="password")
+        role = role_for_token(access_token)
 
         is_senior = (role == "SENIOR_ANALYST")
         unmask = st.checkbox(
             "🔓 Unmask Identifiers",
             value=False,
             disabled=not is_senior,
-            help="Reveals raw account tokens. Permitted ONLY for SENIOR_ANALYST; audited upon access.",
+            help="Reveals raw account tokens only with the configured senior credential; access is audited.",
         )
         if not is_senior and unmask:
             unmask = False
@@ -315,7 +359,8 @@ def run_dashboard():
             st.rerun()
 
         # API Connection Check
-        client = get_api_client(api_url, role)
+        role = role or "ANALYST"
+        client = get_api_client(api_url, role, access_token)
         is_healthy, health_msg = check_api_health(client)
 
         st.markdown("### System Health")
@@ -323,6 +368,7 @@ def run_dashboard():
             st.success(f"● API {health_msg}")
         else:
             st.error(f"● API {health_msg}")
+        _show_api_errors()
 
         st.caption("IBM LinuxONE Architecture: `s390x`")
 
@@ -331,6 +377,7 @@ def run_dashboard():
 
     # KPI Statistics Banner
     stats = fetch_stats(client)
+    _show_api_errors()
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Transactions Processed", f"{stats.get('total_txns', 0):,}")
     k2.metric("Open Alerts", f"{stats.get('alerts_open', 0):,}")
@@ -347,6 +394,7 @@ def run_dashboard():
             status_filter = st.selectbox("Filter Status", ["ALL", "OPEN", "APPROVED", "DISMISSED"], index=1)
 
         alerts = fetch_alerts(client, status=status_filter, unmask=unmask, limit=100)
+        _show_api_errors()
 
         if not alerts:
             st.info("No alerts found matching the current filter criteria.")
@@ -432,7 +480,7 @@ def run_dashboard():
 
                         with btn_approve:
                             if st.button("🚨 Approve (Confirmed Fraud)", type="primary", use_container_width=True):
-                                ok, msg = submit_decision(client, selected_id, "APPROVE", analyst_name, note)
+                                ok, msg = submit_decision(client, selected_id, "APPROVE", "", note)
                                 if ok:
                                     st.success(msg)
                                     time.sleep(1)
@@ -442,7 +490,7 @@ def run_dashboard():
 
                         with btn_dismiss:
                             if st.button("✅ Dismiss (False Positive)", use_container_width=True):
-                                ok, msg = submit_decision(client, selected_id, "DISMISS", analyst_name, note)
+                                ok, msg = submit_decision(client, selected_id, "DISMISS", "", note)
                                 if ok:
                                     st.success(msg)
                                     time.sleep(1)
