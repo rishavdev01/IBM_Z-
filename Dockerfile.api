@@ -1,0 +1,39 @@
+# Multi-architecture Dockerfile for Aegis Exchange API (Part 4)
+# Target: IBM LinuxONE (s390x) and x86_64
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    AEGIS_DB_PATH=/app/data/aegis.db
+
+WORKDIR /app
+
+# Install security updates and curl for health check
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install API and ML dependencies
+COPY requirements-api.txt .
+RUN pip install --upgrade pip && \
+    pip install -r requirements-api.txt
+
+# Create non-root user and persistent data directory
+RUN useradd -u 1000 -m -s /bin/bash aegis && \
+    mkdir -p /app/data && \
+    chown -R aegis:aegis /app
+
+# Copy application and ML models
+COPY app/ /app/app/
+COPY aegis_ml/ /app/aegis_ml/
+COPY docs/CONTRACT.md /app/docs/CONTRACT.md
+
+USER aegis
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
