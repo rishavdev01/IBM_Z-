@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.alerts_store import (
@@ -26,12 +26,12 @@ from app.alerts_store import (
     list_audit,
     write_audit,
 )
+from app.auth import authenticated_role
 from app.masking import (
     mask_alert_detail,
     mask_alert_summary,
     mask_graph_data,
     should_unmask,
-    validate_role,
 )
 
 router = APIRouter(prefix="/v1")
@@ -39,16 +39,9 @@ router = APIRouter(prefix="/v1")
 
 class DecisionRequest(BaseModel):
     decision: Literal["APPROVE", "DISMISS"]
-    analyst: str = Field(..., min_length=1, description="Analyst identifier")
+    # Retained for request compatibility; never used as authenticated identity.
+    analyst: str = Field(default="", description="Deprecated display field; attribution comes from bearer role")
     note: str = Field(default="", description="Optional analyst investigation notes")
-
-
-def _resolve_role(x_role: str | None) -> str:
-    """Validate X-Role header or raise HTTP 400."""
-    try:
-        return validate_role(x_role)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +54,9 @@ def get_alerts_endpoint(
     status: str | None = Query(None, description="Filter by status: OPEN, APPROVED, DISMISSED"),
     limit: int = Query(100, ge=1, le=1000, description="Max alerts to return"),
     unmask: bool = Query(False, description="Unmask account tokens (requires SENIOR_ANALYST)"),
-    x_role: str | None = Header("ANALYST", alias="X-Role"),
+    role: str = Depends(authenticated_role),
 ) -> list[dict[str, Any]]:
     """List fraud alerts with deterministic sorting and privacy masking."""
-    role = _resolve_role(x_role)
     try:
         alerts = list_alerts(status=status, limit=limit)
     except ValueError as e:
@@ -86,10 +78,9 @@ def get_alerts_endpoint(
 def get_alert_detail_endpoint(
     alert_id: int,
     unmask: bool = Query(False, description="Unmask account tokens (requires SENIOR_ANALYST)"),
-    x_role: str | None = Header("ANALYST", alias="X-Role"),
+    role: str = Depends(authenticated_role),
 ) -> dict[str, Any]:
     """Retrieve full alert details including reasons, features, decision history, and audit log."""
-    role = _resolve_role(x_role)
     alert = get_alert(alert_id)
     if alert is None:
         raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found.")
@@ -110,18 +101,17 @@ def get_alert_detail_endpoint(
 def post_decision_endpoint(
     alert_id: int,
     payload: DecisionRequest,
-    x_role: str | None = Header("ANALYST", alias="X-Role"),
+    role: str = Depends(authenticated_role),
 ) -> dict[str, Any]:
     """Submit an analyst decision (APPROVE or DISMISS).
 
     Atomically updates alert status, records decision record, and appends to audit log.
     """
-    role = _resolve_role(x_role)
     try:
         res = add_decision(
             alert_id=alert_id,
             decision=payload.decision,
-            analyst=payload.analyst,
+            analyst=role,
             note=payload.note,
             role=role,
         )
@@ -147,13 +137,12 @@ def get_alert_graph_endpoint(
     request: Request,
     hops: int = Query(2, ge=1, le=3, description="Neighborhood hops (1 to 3)"),
     unmask: bool = Query(False, description="Unmask node IDs (requires SENIOR_ANALYST)"),
-    x_role: str | None = Header("ANALYST", alias="X-Role"),
+    role: str = Depends(authenticated_role),
 ) -> dict[str, Any]:
     """Retrieve the transfer neighborhood graph for the alert's sender.
 
     Nodes are tagged server-side with roles ('sender', 'receiver', 'other') before masking.
     """
-    role = _resolve_role(x_role)
     alert = get_alert(alert_id)
     if alert is None:
         raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found.")
@@ -206,13 +195,32 @@ def get_alert_graph_endpoint(
     )
 
 
+@router.get("/graph/neighborhood/{token}")
+def get_graph_neighborhood_endpoint(
+    token: str,
+    request: Request,
+    hops: int = Query(2, ge=1, le=3),
+    unmask: bool = Query(False),
+    role: str = Depends(authenticated_role),
+) -> dict[str, Any]:
+    """Return a role-authorized graph neighborhood with masked identifiers."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Graph engine is unavailable.")
+    graph = engine.neighborhood(token, hops=hops)
+    if should_unmask(role, unmask):
+        write_audit(actor=role, role=role, action="UNMASK", target="graph_neighborhood",
+                    detail={"hops": hops})
+    return mask_graph_data(graph, sender_raw=token, receiver_raw="", unmask=unmask, role=role)
+
+
 # ---------------------------------------------------------------------------
 # Platform Stats & Audit Endpoints
 # ---------------------------------------------------------------------------
 
 
 @router.get("/stats")
-def get_stats_endpoint() -> dict[str, Any]:
+def get_stats_endpoint(role: str = Depends(authenticated_role)) -> dict[str, Any]:
     """Return platform statistics for the analyst dashboard."""
     return get_stats()
 
@@ -220,10 +228,9 @@ def get_stats_endpoint() -> dict[str, Any]:
 @router.get("/audit")
 def get_audit_endpoint(
     limit: int = Query(200, ge=1, le=1000, description="Max audit entries to return"),
-    x_role: str | None = Header("ANALYST", alias="X-Role"),
+    role: str = Depends(authenticated_role),
 ) -> list[dict[str, Any]]:
     """Retrieve immutable audit log records. Restricted to SENIOR_ANALYST."""
-    role = _resolve_role(x_role)
     if role != "SENIOR_ANALYST":
         raise HTTPException(
             status_code=403,

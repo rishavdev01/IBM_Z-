@@ -10,7 +10,7 @@ DATA FLOW:
 
 ```
 simulator --POST /v1/transactions--> FastAPI app
-FastAPI app -> graph_engine.extract_features(txn) -> aegis_ml.scorer.score(features)
+FastAPI app -> app.graph_engine.extract_features(txn) -> app.scoring.score_features(features)
 -> alerts_store.create_alert(...) (SQLite) -> dashboard reads GET /v1/alerts etc.
 ```
 
@@ -19,7 +19,7 @@ REPO LAYOUT (monorepo aegis-exchange):
 ```
 docs/CONTRACT.md              this block
 simulator/                    PART 1  (own requirements.txt)
-app/main.py, models.py, graph_engine.py, pipeline.py        PART 2
+app/main.py, models.py, graph_engine.py, pipeline.py        Part 2 adapter boundary (graph engine implemented here because Part 2 file is absent)
 app/db.py, alerts_store.py, masking.py, routers/alerts.py   PART 4
 aegis_ml/features.py, train.py, scorer.py, model/           PART 3
 dashboard/                    PART 4  (own requirements.txt)
@@ -29,7 +29,9 @@ requirements-api.txt          Parts 2 and 3 append lines only
 docker-compose.yml, Dockerfile.api, Dockerfile.dashboard, Dockerfile.simulator   PART 4
 ```
 
-ENV VARS (defaults): `AEGIS_SALT=hackathon-salt`, `AEGIS_DB_PATH=data/aegis.db`, `AEGIS_API_URL=http://localhost:8000`, `WINDOW_HOURS=24`, `ALERT_THRESHOLD=0.40`
+ENV VARS: `AEGIS_SALT` is required in production and must be shared by the simulator/API; `AEGIS_DB_PATH=data/aegis.db`, `AEGIS_API_URL=http://localhost:8000`, `WINDOW_HOURS=24`, `ALERT_THRESHOLD=0.40`. Configure `AEGIS_ANALYST_TOKEN` and `AEGIS_SENIOR_ANALYST_TOKEN` outside source control. Never reuse the public demo salt for deployment.
+
+The repository does not contain a trained Part 3 model. The API-owned adapter defaults to an explainable feature-based rules backend (`AEGIS_SCORER_MODE=rules`). Setting `AEGIS_SCORER_MODE=ml` invokes the `aegis_ml.scorer.score(features)` interface when a real implementation is supplied. Rule scores are heuristic triage, not model predictions.
 
 PORTS: api 8000, dashboard 8501.
 
@@ -66,7 +68,7 @@ GRAPH FEATURES: `app.state.engine` (GraphEngine in `app/graph_engine.py`): `engi
 - `sender_new_device` (0/1: device_token never seen with this sender before)
 - `amount_vs_sender_avg` (amount / sender's average amount in window; 1.0 if no history)
 
-SCORE RESULT: `aegis_ml.scorer.score(features: dict) -> dict`
+SCORE RESULT: `aegis_ml.scorer.score(features: dict) -> dict`. A scorer module must export `MODEL_AVAILABLE = True` to opt in to ML mode; absent that capability the platform uses its transparent rules backend. This capability does not claim that a model is trained.
 
 ```python
 {
@@ -112,7 +114,13 @@ Decision meaning:
 - `APPROVE` = analyst confirms the alert as real suspicious activity
 - `DISMISS` = false positive
 
-RBAC MOCK (Part 4): header `X-Role` is `ANALYST` or `SENIOR_ANALYST`. Alert endpoints return tokens masked (first 4 chars + `"..."`) unless `X-Role` is `SENIOR_ANALYST` and the query has `unmask=true`; every unmask is written to `audit_log`.
+AUTHENTICATION: The `X-Role` header only selects the requested role; it is never proof of identity. Every analyst endpoint requires the corresponding configured `Authorization: Bearer ...` token (`AEGIS_ANALYST_TOKEN` or `AEGIS_SENIOR_ANALYST_TOKEN`). Production startup requires three independent secrets of at least 32 characters: the tokenization salt and each role token. Generate random values out of band, store them in a deployment secret manager, and never commit them. Shared role tokens remain a prototype boundary; decision attribution records the authenticated role, not the caller-supplied legacy `analyst` field. Deploy behind an identity provider/API gateway for per-user identity, revocation and stronger session controls.
+
+TOKENIZATION CONFIGURATION: `AEGIS_SALT` must be identical in simulator and API so the same account produces the same 16-character token. Changing it fragments graph continuity; existing pseudonyms cannot be converted without source identifiers. Do not use demo, test, repeated-character, sequence, or other predictable secrets in production. API container access logging is disabled because graph-neighborhood URLs contain account tokens; preserve that setting when overriding the Uvicorn command.
+
+Alert endpoints return tokens masked (first 4 chars + `"..."`) unless the authenticated role is `SENIOR_ANALYST` and the query has `unmask=true`; every authorized unmask is written to `audit_log`.
+
+TOKEN ROTATION: tokenization is deterministic and persisted transaction/graph records contain only tokens, not original identifiers. Changing `AEGIS_SALT` changes tokens for new simulator data and fragments graph continuity. Existing tokens cannot be converted to a new salt without the original identifiers; coordinate a new-data boundary or perform an authorized re-tokenization while raw identifiers remain available.
 
 SQLITE TABLES (Part 4 owns): `alerts`, `decisions`, `audit_log`, `transactions`.
 

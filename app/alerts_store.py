@@ -17,7 +17,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import (
@@ -113,6 +113,7 @@ def record_txn(
     txn: dict,
     result: dict,
     factory: sessionmaker | None = None,
+    processing_ms: float = 0.0,
 ) -> None:
     """Persist a scored transaction, handling duplicates safely."""
     session = _get_session(factory)
@@ -127,6 +128,8 @@ def record_txn(
             # Update score if not already set
             existing.risk_score = float(result.get("risk_score", existing.risk_score))
             existing.risk_level = str(result.get("risk_level", existing.risk_level))
+            existing.reasons_json = _serialize_json(result.get("reasons", []))
+            existing.processing_ms = float(processing_ms)
             session.commit()
             return
 
@@ -149,9 +152,128 @@ def record_txn(
             risk_level=str(result.get("risk_level", "LOW")),
             truth_is_scam=truth_is_scam,
             truth_typology=truth_typology,
+            reasons_json=_serialize_json(result.get("reasons", [])),
+            processing_ms=float(processing_ms),
         )
         session.add(row)
         session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_transaction(txn_id: str, factory: sessionmaker | None = None) -> dict | None:
+    """Return a previously scored transaction for idempotent API responses."""
+    session = _get_session(factory)
+    try:
+        row = session.get(TransactionRow, txn_id)
+        if row is None:
+            return None
+        return {"txn_id": row.txn_id, "risk_score": row.risk_score,
+                "risk_level": row.risk_level, "reasons": _deserialize_json(row.reasons_json, [])}
+    finally:
+        session.close()
+
+
+def list_recent_transactions(since: str, limit: int = 500_000, factory: sessionmaker | None = None) -> list[dict]:
+    """Return recent transaction graph inputs in timestamp order for warm startup."""
+    session = _get_session(factory)
+    try:
+        rows = session.scalars(select(TransactionRow).order_by(TransactionRow.timestamp.desc(), TransactionRow.txn_id.desc())
+                               .limit(limit)).all()
+        cutoff = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        def included(row: TransactionRow) -> bool:
+            moment = datetime.fromisoformat(row.timestamp.replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return moment >= cutoff
+        recent = [row for row in rows if included(row)]
+        recent.sort(key=lambda row: (row.timestamp, row.txn_id))
+        return [{"txn_id": row.txn_id, "timestamp": row.timestamp, "sender_token": row.sender_token,
+                 "receiver_token": row.receiver_token, "amount": row.amount,
+                 "channel": row.channel, "device_token": row.device_token} for row in recent]
+    finally:
+        session.close()
+
+
+def get_alert_for_transaction(txn_id: str, factory: sessionmaker | None = None) -> dict | None:
+    """Return the earliest persisted alert for a transaction, if any."""
+    session = _get_session(factory)
+    try:
+        row = session.scalar(select(AlertRow).where(AlertRow.txn_id == txn_id).order_by(AlertRow.alert_id).limit(1))
+        return {"alert_id": row.alert_id} if row is not None else None
+    finally:
+        session.close()
+
+
+def persist_transaction_result(
+    txn: dict, features: dict, result: dict, threshold: float, processing_ms: float = 0.0,
+    factory: sessionmaker | None = None,
+) -> tuple[dict, int | None]:
+    """Atomically persist a scored transaction and its qualifying alert.
+
+    BEGIN IMMEDIATE serializes competing writers across SQLite connections and
+    workers. A committed transaction can therefore never lack its alert.
+    """
+    session = _get_session(factory)
+    try:
+        # Acquire SQLite's reserved write lock before checking idempotency.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        txn_id = str(txn["txn_id"])
+        row = session.get(TransactionRow, txn_id)
+        if row is None:
+            truth = txn.get("_truth")
+            row = TransactionRow(
+                txn_id=txn_id,
+                timestamp=str(txn.get("timestamp", datetime.now(timezone.utc).isoformat())),
+                sender_token=str(txn.get("sender_token", "")),
+                receiver_token=str(txn.get("receiver_token", "")),
+                amount=float(txn.get("amount", 0.0)),
+                channel=str(txn.get("channel", "UPI")),
+                device_token=str(txn.get("device_token", "")),
+                risk_score=float(result.get("risk_score", 0.0)),
+                risk_level=str(result.get("risk_level", "LOW")),
+                truth_is_scam=(1 if truth.get("is_scam") else 0) if isinstance(truth, dict) else None,
+                truth_typology=truth.get("typology") if isinstance(truth, dict) else None,
+                reasons_json=_serialize_json(result.get("reasons", [])),
+                processing_ms=float(processing_ms),
+                features_json=_serialize_json(features),
+            )
+            session.add(row)
+            session.flush()
+        else:
+            # Recover legacy partial rows written before transaction/alert became atomic.
+            stored_features = _deserialize_json(row.features_json, {})
+            if not stored_features:
+                row.features_json = _serialize_json(features)
+
+        alert = session.scalar(select(AlertRow).where(AlertRow.txn_id == txn_id).order_by(AlertRow.alert_id).limit(1))
+        should_alert = float(row.risk_score) >= threshold
+        if should_alert and alert is None:
+            alert = AlertRow(
+                txn_id=txn_id,
+                created_at=str(txn.get("timestamp") or datetime.now(timezone.utc).isoformat()),
+                status="OPEN",
+                risk_score=float(row.risk_score),
+                risk_level=str(row.risk_level),
+                reasons_json=row.reasons_json,
+                features_json=row.features_json or _serialize_json(features),
+                sender_token=row.sender_token,
+                receiver_token=row.receiver_token,
+                amount=row.amount,
+            )
+            session.add(alert)
+            session.flush()
+        session.commit()
+        response = {
+            "txn_id": row.txn_id,
+            "risk_score": float(row.risk_score),
+            "risk_level": row.risk_level,
+            "reasons": _deserialize_json(row.reasons_json, []),
+        }
+        return response, int(alert.alert_id) if alert is not None else None
     except Exception:
         session.rollback()
         raise
@@ -293,6 +415,7 @@ def add_decision(
 
     session = _get_session(factory)
     try:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
         alert = session.get(AlertRow, alert_id)
         if alert is None:
             raise AlertNotFoundError(f"Alert {alert_id} not found.")
@@ -301,7 +424,11 @@ def add_decision(
 
         decided_at = datetime.now(timezone.utc).isoformat()
         new_status = "APPROVED" if decision == "APPROVE" else "DISMISSED"
-        alert.status = new_status
+        changed = session.execute(
+            update(AlertRow).where(AlertRow.alert_id == alert_id, AlertRow.status == "OPEN").values(status=new_status)
+        )
+        if changed.rowcount != 1:
+            raise AlertAlreadyDecidedError(f"Alert {alert_id} is no longer OPEN.")
 
         # Insert decision record
         dec_row = DecisionRow(
@@ -426,11 +553,12 @@ def get_stats(factory: sessionmaker | None = None) -> dict:
         total_txns = session.scalar(select(func.count(TransactionRow.txn_id))) or 0
         alerts_open = session.scalar(select(func.count(AlertRow.alert_id)).where(AlertRow.status == "OPEN")) or 0
         alerts_total = session.scalar(select(func.count(AlertRow.alert_id))) or 0
+        avg_latency_ms = session.scalar(select(func.avg(TransactionRow.processing_ms)).where(TransactionRow.processing_ms > 0)) or 0.0
         return {
             "total_txns": int(total_txns),
             "alerts_open": int(alerts_open),
             "alerts_total": int(alerts_total),
-            "avg_latency_ms": 14.2,
+            "avg_latency_ms": round(float(avg_latency_ms), 2),
         }
     finally:
         session.close()

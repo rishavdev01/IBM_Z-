@@ -99,6 +99,9 @@ class TransactionRow(Base):
     risk_level = Column(String, nullable=False)
     truth_is_scam = Column(Integer, nullable=True)   # 0 / 1 / NULL
     truth_typology = Column(String, nullable=True)
+    reasons_json = Column(Text, nullable=False, default="[]")
+    processing_ms = Column(Float, nullable=False, default=0.0)
+    features_json = Column(Text, nullable=False, default="{}")
 
 
 class AlertRow(Base):
@@ -194,6 +197,16 @@ def init_db(db_url: str | None = None) -> None:
     """Create all tables idempotently.  Safe to call on every application startup."""
     engine = get_engine(db_url)
     Base.metadata.create_all(engine, checkfirst=True)
+    # Additive, data-preserving migration for databases created before the
+    # transaction explanations field was introduced.
+    with engine.begin() as connection:
+        columns = {row["name"] for row in connection.execute(text("PRAGMA table_info(transactions)")).mappings()}
+        if "reasons_json" not in columns:
+            connection.execute(text("ALTER TABLE transactions ADD COLUMN reasons_json TEXT NOT NULL DEFAULT '[]'"))
+        if "processing_ms" not in columns:
+            connection.execute(text("ALTER TABLE transactions ADD COLUMN processing_ms FLOAT NOT NULL DEFAULT 0.0"))
+        if "features_json" not in columns:
+            connection.execute(text("ALTER TABLE transactions ADD COLUMN features_json TEXT NOT NULL DEFAULT '{}'"))
 
 
 def get_db() -> Session:
