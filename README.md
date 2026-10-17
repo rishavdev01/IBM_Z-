@@ -52,3 +52,33 @@ Stubs so nobody waits:
 - `app.routers.alerts` is an empty `/v1` router
 
 Copy `.env.example` to `.env` for local defaults (`AEGIS_SALT`, `AEGIS_DB_PATH`, `AEGIS_API_URL`, `WINDOW_HOURS`, `ALERT_THRESHOLD`).
+
+## Part 3: ML Scoring & Retraining
+
+Part 3 delivers real-time gradient boosted scoring with top 3 explainability reasons and a rule-based fallback.
+
+### Retraining the Models
+
+Train both LightGBM and Scikit-Learn HistGradientBoosting models:
+
+```bash
+# Option A: Train on synthetic graph feature dataset
+python -m aegis_ml.train --source synthetic
+
+# Option B: Train on labeled transaction replay CSV
+python -m aegis_ml.train --source csv
+```
+
+Artifacts generated under `aegis_ml/model/`:
+- `model_lightgbm.joblib`: Default LightGBM classifier with early stopping.
+- `model_sklearn.joblib`: Fallback / LinuxONE Scikit-Learn HistGradientBoosting classifier.
+- `metadata.json`: Feature ordering, benign baseline medians, thresholds, and performance metrics.
+
+### Generate Model Evaluation Report
+
+To update `docs/model_report.md`:
+
+```bash
+python scripts/eval_report.py
+```
+
