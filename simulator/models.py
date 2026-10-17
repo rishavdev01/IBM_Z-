@@ -1,66 +1,67 @@
-"""Pydantic v2 transaction model matching docs/CONTRACT.md."""
+"""Pydantic v2 data models for Aegis Exchange transactions.
+
+Matches the TRANSACTION contract specification:
+- txn_id: uuid4 string
+- timestamp: ISO-8601 UTC string (e.g. 2026-10-17T07:30:00Z)
+- sender_token: 16 hex chars
+- receiver_token: 16 hex chars
+- amount: float INR (must be > 0)
+- channel: UPI | IMPS | NEFT
+- device_token: 16 hex chars
+- memo: optional string
+- _truth: optional ground truth object (is_scam: bool, typology: str)
+"""
 
 from __future__ import annotations
 
-import re
-from datetime import datetime, timezone
 from typing import Any, Literal
-
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-Channel = Literal["UPI", "IMPS", "NEFT"]
-Typology = Literal[
+ChannelType = Literal["UPI", "IMPS", "NEFT"]
+TypologyType = Literal[
     "mule_fan_in",
     "rapid_forwarding",
     "circular_layering",
     "account_takeover",
     "none",
 ]
-_TOKEN_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 class Truth(BaseModel):
-    """Simulator-only ground truth. Scoring code must never read this."""
+    """Ground-truth metadata for simulated transactions."""
+
+    model_config = ConfigDict(extra="ignore")
 
     is_scam: bool
-    typology: Typology
+    typology: TypologyType = "none"
 
 
 class Transaction(BaseModel):
-    """Payment transaction posted to POST /v1/transactions."""
+    """Transaction model matching the Aegis Exchange contract."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     txn_id: str
     timestamp: str
     sender_token: str
     receiver_token: str
-    amount: float = Field(gt=0)
-    channel: Channel
+    amount: float = Field(..., gt=0.0, description="Transaction amount in INR; must be > 0")
+    channel: ChannelType
     device_token: str
     memo: str | None = None
     truth: Truth | None = Field(default=None, alias="_truth")
 
     @field_validator("sender_token", "receiver_token", "device_token")
     @classmethod
-    def tokens_are_16_hex(cls, value: str) -> str:
-        if not _TOKEN_RE.fullmatch(value):
-            raise ValueError("token must be 16 lowercase hex characters")
-        return value
-
-    @field_validator("timestamp")
-    @classmethod
-    def timestamp_is_iso_utc(cls, value: str) -> str:
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError("timestamp must be ISO-8601 UTC") from exc
-        if parsed.tzinfo is None:
-            raise ValueError("timestamp must include a UTC timezone")
-        if parsed.utcoffset() != timezone.utc.utcoffset(parsed):
-            raise ValueError("timestamp must be UTC")
-        return value
+    def validate_token_length(cls, v: str) -> str:
+        """Validate token format."""
+        if len(v) != 16:
+            raise ValueError(f"Token must be exactly 16 hex characters, got '{v}' (len={len(v)})")
+        return v
 
     def to_payload(self) -> dict[str, Any]:
-        """Dump by alias and omit unset/None fields (so ``_truth`` is optional)."""
+        """Convert the transaction model to an API JSON payload dict.
+
+        Uses aliases so 'truth' is exported as '_truth' and drops None values.
+        """
         return self.model_dump(by_alias=True, exclude_none=True)

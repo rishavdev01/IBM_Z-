@@ -1,22 +1,29 @@
-"""Salted account/device tokenization (do not name this module tokenize.py)."""
+"""Salted tokenization utility for accounts and devices.
+
+Uses SHA-256 with a salt to produce deterministic 16-character hex tokens.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import os
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
-DEFAULT_SALT = "hackathon-salt"
-
 
 def tokenize(raw_id: str, salt: str | None = None) -> str:
-    """Return the first 16 hex chars of sha256(salt + raw_id).
+    """Tokenize a raw identifier (account ID or device ID).
 
-    ``salt`` defaults to env ``AEGIS_SALT``, then ``hackathon-salt``.
+    Calculates SHA-256 of (salt + raw_id) and returns the first 16 hex characters.
+    If salt is None, defaults to the AEGIS_SALT environment variable, falling back
+    to 'hackathon-salt'.
+
+    Args:
+        raw_id: The raw string ID (e.g. 'ACC000123' or 'DEV123_1').
+        salt: Optional salt override.
+
+    Returns:
+        16-character hexadecimal token string.
     """
-    used = salt if salt is not None else os.getenv("AEGIS_SALT", DEFAULT_SALT)
-    digest = hashlib.sha256(f"{used}{raw_id}".encode("utf-8")).hexdigest()
-    return digest[:16]
+    if salt is None:
+        salt = os.getenv("AEGIS_SALT", "hackathon-salt")
+    payload = f"{salt}{raw_id}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]

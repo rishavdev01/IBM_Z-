@@ -1,193 +1,176 @@
-"""Deterministic benign UPI/IMPS/NEFT traffic."""
+"""Realistic benign payment generator for Aegis Exchange.
+
+Simulates account pool with realistic topologies (sparse graph via frequent counterparties),
+lognormal transaction amounts, channel preferences, and exponential inter-arrival streaming.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from uuid import UUID
-
+from datetime import datetime, timezone, timedelta
+from typing import Iterator
+import uuid
 import numpy as np
 
-from simulator.models import Channel, Transaction, Truth
+from simulator.models import Transaction, Truth, ChannelType
 from simulator.tokenization import tokenize
 
-CHANNELS: tuple[Channel, Channel, Channel] = ("UPI", "IMPS", "NEFT")
+CHANNELS: list[ChannelType] = ["UPI", "IMPS", "NEFT"]
 
 
 @dataclass
 class Account:
-    """One synthetic account in the pool."""
+    """Represents a simulated bank account with behavioural parameters."""
 
-    raw_id: str
-    devices: list[str]
-    typical_amount: float
-    channel_p: np.ndarray
-    active_hours: set[int]
-    counterparties: list[str] = field(default_factory=list)
+    account_id: str
+    token: str
+    raw_devices: list[str]
+    device_tokens: list[str]
+    typical_median: float
+    typical_amount_mu: float
+    typical_amount_sigma: float
+    channel_probs: list[float]  # UPI, IMPS, NEFT
+    active_start_hour: int
+    active_end_hour: int
+    counterparty_indices: list[int] = field(default_factory=list)
 
 
 class AccountPool:
-    """Fixed set of accounts with devices, counterparties, and amount habits."""
+    """A pool of simulated accounts with realistic banking profiles."""
 
     def __init__(self, n_accounts: int = 2000, seed: int = 42) -> None:
         self.n_accounts = n_accounts
         self.seed = seed
-        rng = np.random.default_rng(seed)
+        self.rng = np.random.default_rng(seed)
         self.accounts: list[Account] = []
-        for i in range(n_accounts):
+        self._build_pool()
+
+    def _build_pool(self) -> None:
+        """Initialize accounts, devices, amounts, and sparse counterparty graph."""
+        # Step 1: Create accounts
+        for i in range(self.n_accounts):
             raw_id = f"ACC{i:06d}"
-            n_devices = int(rng.integers(1, 3))
-            devices = [f"DEV{i:06d}_{d}" for d in range(n_devices)]
-            # lognormal with median ~1500 INR: median = exp(mu)
-            typical = float(np.clip(rng.lognormal(mean=np.log(1500.0), sigma=0.55), 80.0, 25000.0))
-            weights = rng.dirichlet([6.0, 2.5, 1.5])
-            n_hours = int(rng.integers(8, 17))
-            hours = set(int(h) for h in rng.choice(24, size=n_hours, replace=False))
-            self.accounts.append(
-                Account(
-                    raw_id=raw_id,
-                    devices=devices,
-                    typical_amount=typical,
-                    channel_p=weights,
-                    active_hours=hours,
-                )
+            acc_token = tokenize(raw_id)
+
+            # 1-2 devices per account (75% 1 device, 25% 2 devices)
+            num_devices = 1 if self.rng.random() < 0.75 else 2
+            raw_devices = [f"DEV_{raw_id}_{d}" for d in range(num_devices)]
+            dev_tokens = [tokenize(d) for d in raw_devices]
+
+            # Typical amount: lognormal with median around 1500 INR
+            # Account median varies around 1500 (e.g. 700 to 3000)
+            account_median = float(self.rng.uniform(700.0, 3000.0))
+            mu = float(np.log(account_median))
+            sigma = float(self.rng.uniform(0.4, 0.7))
+
+            # Channel preference: UPI dominant (60-80%), IMPS (15-30%), NEFT (5-15%)
+            alpha = [7.0, 2.0, 1.0]
+            raw_weights = self.rng.dirichlet(alpha)
+            channel_probs = [float(w) for w in raw_weights]
+
+            # Active hours: typically active 6am-10pm UTC
+            start_hour = int(self.rng.integers(5, 9))
+            end_hour = int(self.rng.integers(21, 24))
+
+            acc = Account(
+                account_id=raw_id,
+                token=acc_token,
+                raw_devices=raw_devices,
+                device_tokens=dev_tokens,
+                typical_median=account_median,
+                typical_amount_mu=mu,
+                typical_amount_sigma=sigma,
+                channel_probs=channel_probs,
+                active_start_hour=start_hour,
+                active_end_hour=end_hour,
             )
-        for i, acct in enumerate(self.accounts):
-            n_cp = int(rng.integers(5, 16))
-            others = [j for j in range(n_accounts) if j != i]
-            chosen = rng.choice(others, size=min(n_cp, len(others)), replace=False)
-            acct.counterparties = [self.accounts[int(j)].raw_id for j in chosen]
+            self.accounts.append(acc)
 
-    def by_raw_id(self, raw_id: str) -> Account | None:
-        """Look up an account, or None if it is not in the pool."""
-        if raw_id.startswith("ACC") and raw_id[3:].isdigit():
-            idx = int(raw_id[3:])
-            if 0 <= idx < len(self.accounts) and self.accounts[idx].raw_id == raw_id:
-                return self.accounts[idx]
-        for acct in self.accounts:
-            if acct.raw_id == raw_id:
-                return acct
-        return None
-
-    def random_account(self, rng: np.random.Generator, exclude: str | None = None) -> Account:
-        """Pick a uniform random pool account, optionally excluding one raw id."""
-        idx = int(rng.integers(0, len(self.accounts)))
-        acct = self.accounts[idx]
-        if exclude is not None and acct.raw_id == exclude:
-            idx = (idx + 1) % len(self.accounts)
-            acct = self.accounts[idx]
-        return acct
-
-
-def uuid4_from_rng(rng: np.random.Generator) -> str:
-    """Deterministic UUID4 from a numpy Generator."""
-    return str(UUID(bytes=bytes(rng.bytes(16)), version=4))
-
-
-def format_ts(dt: datetime) -> str:
-    """Format a timezone-aware datetime as ISO-8601 UTC with a Z suffix."""
-    utc = dt.astimezone(timezone.utc)
-    return utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-
-def pick_channel(rng: np.random.Generator, acct: Account) -> Channel:
-    """Sample a channel from the account's preferred mix."""
-    idx = int(rng.choice(3, p=acct.channel_p))
-    return CHANNELS[idx]
-
-
-def pick_amount(rng: np.random.Generator, typical: float) -> float:
-    """Mostly 50-5000 INR around the account typical, with rare spikes to 50000."""
-    if rng.random() < 0.02:
-        return float(rng.uniform(8000.0, 50000.0))
-    draw = float(rng.lognormal(mean=np.log(typical), sigma=0.45))
-    return float(np.clip(draw, 50.0, 5000.0))
-
-
-def make_transaction(
-    *,
-    rng: np.random.Generator,
-    sender_raw: str,
-    receiver_raw: str,
-    device_raw: str,
-    amount: float,
-    channel: Channel,
-    when: datetime,
-    is_scam: bool,
-    typology: str,
-    memo: str | None = None,
-) -> Transaction:
-    """Build a contract-shaped Transaction with tokens and ground truth."""
-    return Transaction(
-        txn_id=uuid4_from_rng(rng),
-        timestamp=format_ts(when),
-        sender_token=tokenize(sender_raw),
-        receiver_token=tokenize(receiver_raw),
-        amount=round(float(amount), 2),
-        channel=channel,
-        device_token=tokenize(device_raw),
-        memo=memo,
-        truth=Truth(is_scam=is_scam, typology=typology),  # type: ignore[arg-type]
-    )
-
-
-def _active_accounts(pool: AccountPool, hour: int) -> list[Account]:
-    active = [a for a in pool.accounts if hour in a.active_hours]
-    return active if active else list(pool.accounts)
+        # Step 2: Assign 5-15 frequent counterparties per account
+        for i, acc in enumerate(self.accounts):
+            k = int(self.rng.integers(5, 16))
+            # Pick k random accounts excluding self
+            candidates = self.rng.choice(self.n_accounts, size=k * 2, replace=False)
+            counterparties = [int(c) for c in candidates if c != i][:k]
+            acc.counterparty_indices = counterparties
 
 
 def benign_stream(
     pool: AccountPool,
     start: datetime,
-    rate_per_sec: float,
-    seed: int,
+    rate_per_sec: float = 20.0,
+    seed: int = 42,
 ) -> Iterator[Transaction]:
-    """Infinite (until stopped) benign payments with exponential inter-arrivals.
+    """Generate a continuous deterministic stream of benign transactions.
 
-    Fully deterministic for a given ``(pool.seed, seed, start, rate_per_sec)``.
-    Every transaction has ``truth {is_scam: false, typology: "none"}``.
+    Args:
+        pool: The AccountPool to sample accounts from.
+        start: Starting datetime (UTC).
+        rate_per_sec: Mean transaction rate per second.
+        seed: Random seed for reproducibility.
+
+    Yields:
+        Transaction instances with truth: {is_scam: False, typology: "none"}.
     """
     rng = np.random.default_rng(seed)
+
     if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
-    t = start
-    mean_gap = 1.0 / rate_per_sec if rate_per_sec > 0 else 1.0
+        current_time = start.replace(tzinfo=timezone.utc)
+    else:
+        current_time = start.astimezone(timezone.utc)
+
+    truth_benign = Truth(is_scam=False, typology="none")
+
     while True:
-        gap = float(rng.exponential(mean_gap))
-        t = t + timedelta(seconds=max(gap, 1e-4))
-        hour = t.astimezone(timezone.utc).hour
-        active = _active_accounts(pool, hour)
-        sender = active[int(rng.integers(0, len(active)))]
-        if rng.random() < 0.90 and sender.counterparties:
-            recv_raw = sender.counterparties[int(rng.integers(0, len(sender.counterparties)))]
+        # Exponential inter-arrival time
+        dt_sec = float(rng.exponential(1.0 / rate_per_sec))
+        # Ensure strictly positive step (minimum 1 millisecond)
+        if dt_sec < 0.001:
+            dt_sec = 0.001
+        current_time += timedelta(seconds=dt_sec)
+
+        # Sender selection
+        sender_idx = int(rng.integers(0, pool.n_accounts))
+        sender = pool.accounts[sender_idx]
+
+        # Receiver selection: 90% to frequent counterparties, 10% to random
+        if rng.random() < 0.90 and sender.counterparty_indices:
+            receiver_idx = int(rng.choice(sender.counterparty_indices))
         else:
-            recv_raw = pool.random_account(rng, exclude=sender.raw_id).raw_id
-        device_raw = sender.devices[int(rng.integers(0, len(sender.devices)))]
-        yield make_transaction(
-            rng=rng,
-            sender_raw=sender.raw_id,
-            receiver_raw=recv_raw,
-            device_raw=device_raw,
-            amount=pick_amount(rng, sender.typical_amount),
-            channel=pick_channel(rng, sender),
-            when=t,
-            is_scam=False,
-            typology="none",
+            receiver_idx = int(rng.integers(0, pool.n_accounts))
+            while receiver_idx == sender_idx:
+                receiver_idx = int(rng.integers(0, pool.n_accounts))
+        receiver = pool.accounts[receiver_idx]
+
+        # Device selection from sender's devices
+        device_token = str(rng.choice(sender.device_tokens))
+
+        # Channel selection from sender's distribution
+        channel: ChannelType = str(rng.choice(CHANNELS, p=sender.channel_probs))  # type: ignore
+
+        # Amount generation: mostly 50-5000 INR with rare spikes up to 50000
+        if rng.random() < 0.01:
+            # 1% rare high-value spike
+            amt = float(rng.uniform(10000.0, 50000.0))
+        else:
+            sampled_amt = float(rng.lognormal(sender.typical_amount_mu, sender.typical_amount_sigma))
+            amt = float(np.clip(sampled_amt, 50.0, 5000.0))
+        amount = round(amt, 2)
+
+        # Deterministic UUID from RNG bytes
+        uuid_bytes = bytes(rng.bytes(16))
+        txn_id = str(uuid.UUID(bytes=uuid_bytes, version=4))
+
+        ts_str = current_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        txn = Transaction(
+            txn_id=txn_id,
+            timestamp=ts_str,
+            sender_token=sender.token,
+            receiver_token=receiver.token,
+            amount=amount,
+            channel=channel,
+            device_token=device_token,
+            truth=truth_benign,
         )
-
-
-def take_benign(
-    pool: AccountPool,
-    start: datetime,
-    n: int,
-    rate_per_sec: float,
-    seed: int,
-) -> list[Transaction]:
-    """Return the first ``n`` benign transactions from the stream."""
-    out: list[Transaction] = []
-    for txn in benign_stream(pool, start, rate_per_sec, seed):
-        out.append(txn)
-        if len(out) >= n:
-            break
-    return out
+        yield txn

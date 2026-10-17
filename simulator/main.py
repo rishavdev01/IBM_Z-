@@ -1,250 +1,372 @@
-"""CLI: stream payments to the API, export a labeled CSV, or fire a demo burst."""
+"""CLI for Part 1: Simulator.
+
+Supports three commands:
+- stream: Replays synthetic transactions into the API in real time.
+- dataset: Exports 50,000 labeled transactions to CSV for ML training.
+- burst: Injects an immediate scam burst to trigger a live demo alert.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import csv
+from datetime import datetime, timezone, timedelta
 import os
-import signal
 import sys
 import time
-from datetime import datetime, timezone
-from pathlib import Path
-
+from typing import Any
 import httpx
-from dotenv import load_dotenv
+import numpy as np
 
-from simulator.generator import AccountPool, take_benign
+from simulator.generator import AccountPool, benign_stream
 from simulator.models import Transaction
-from simulator.typologies import TYPOLOGY_FNS, inject_scenarios
-
-load_dotenv()
-
-DEFAULT_API = os.getenv("AEGIS_API_URL", "http://localhost:8000")
-DEFAULT_START = datetime(2026, 10, 17, 7, 0, 0, tzinfo=timezone.utc)
-CSV_COLUMNS = [
-    "txn_id",
-    "timestamp",
-    "sender_token",
-    "receiver_token",
-    "amount",
-    "channel",
-    "device_token",
-    "memo",
-    "is_scam",
-    "typology",
-]
+from simulator.typologies import (
+    account_takeover,
+    circular_layering,
+    inject_scenarios,
+    mule_fan_in,
+    rapid_forwarding,
+)
 
 
-def _build_dataset(n: int, seed: int, scam_rate: float = 0.04) -> list[Transaction]:
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: dict[str, Any],
+    sem: asyncio.Semaphore,
+    retries: int = 2,
+) -> dict[str, Any] | None:
+    """POST transaction with semaphore concurrency limit and up to 2 retries."""
+    for attempt in range(retries + 1):
+        try:
+            async with sem:
+                resp = await client.post(url, json=payload, timeout=5.0)
+                if resp.status_code in (200, 201):
+                    return resp.json()
+        except Exception:
+            if attempt == retries:
+                return None
+            await asyncio.sleep(0.1 * (2**attempt))
+    return None
+
+
+async def run_stream(
+    api_url: str,
+    rate: float = 20.0,
+    duration: float = 300.0,
+    scam_rate: float = 0.04,
+    seed: int = 42,
+) -> None:
+    """Stream transactions to the API at the configured rate and print live metrics."""
+    print("=" * 70)
+    print("Aegis Exchange - Transaction Stream Client")
+    print(f"API Target:    {api_url}/v1/transactions")
+    print(f"Send Rate:     {rate:.1f} txns/sec")
+    print(f"Duration:      {duration:.0f} seconds")
+    print(f"Scam Rate:     {scam_rate * 100:.1f}%")
+    print(f"Random Seed:   {seed}")
+    print("=" * 70)
+
+    endpoint = f"{api_url.rstrip('/')}/v1/transactions"
+    sem = asyncio.Semaphore(20)
+
+    # Pre-generate transactions for duration + buffer
+    target_count = int(rate * duration * 1.1) + 200
     pool = AccountPool(n_accounts=2000, seed=seed)
-    n_benign = max(1, int(round(n * (1.0 - scam_rate))))
-    benign = take_benign(pool, DEFAULT_START, n_benign, rate_per_sec=20.0, seed=seed)
-    return inject_scenarios(benign, pool, scam_rate=scam_rate, seed=seed)
+    start_time = datetime.now(timezone.utc)
+    b_stream = benign_stream(pool, start=start_time, rate_per_sec=rate, seed=seed)
+
+    n_benign = max(100, int(target_count * (1.0 - scam_rate)))
+    benign_txns = [next(b_stream) for _ in range(n_benign)]
+    all_txns = inject_scenarios(benign_txns, pool, scam_rate=scam_rate, seed=seed)
+
+    # Metrics state
+    total_sent = 0
+    total_errors = 0
+    total_flagged = 0
+    tp = 0
+    fp = 0
+    fn = 0
+    tn = 0
+
+    stop_event = asyncio.Event()
+
+    async def report_loop() -> None:
+        start_t = time.time()
+        while not stop_event.is_set():
+            await asyncio.sleep(5.0)
+            elapsed = time.time() - start_t
+            precision = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
+            recall = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
+            print(
+                f"[{elapsed:05.1f}s] Sent: {total_sent:5d} | "
+                f"Errors: {total_errors:3d} | "
+                f"Flagged: {total_flagged:4d} | "
+                f"Precision: {precision:5.1f}% | "
+                f"Recall: {recall:5.1f}%"
+            )
+
+    async def worker(client: httpx.AsyncClient, txn: Transaction) -> None:
+        nonlocal total_sent, total_errors, total_flagged, tp, fp, fn, tn
+        payload = txn.to_payload()
+        res = await _post_with_retry(client, endpoint, payload, sem, retries=2)
+        total_sent += 1
+
+        is_scam_truth = txn.truth.is_scam if txn.truth else False
+
+        if res is None:
+            total_errors += 1
+            return
+
+        risk_level = res.get("risk_level", "LOW")
+        is_flagged = risk_level in ("MEDIUM", "HIGH")
+
+        if is_flagged:
+            total_flagged += 1
+
+        if is_flagged and is_scam_truth:
+            tp += 1
+        elif is_flagged and not is_scam_truth:
+            fp += 1
+        elif not is_flagged and is_scam_truth:
+            fn += 1
+        else:
+            tn += 1
+
+    reporter_task = asyncio.create_task(report_loop())
+    interval = 1.0 / rate
+    tasks: list[asyncio.Task] = []
+
+    start_wall = time.time()
+    try:
+        async with httpx.AsyncClient() as client:
+            for txn in all_txns:
+                if time.time() - start_wall >= duration:
+                    break
+
+                t = asyncio.create_task(worker(client, txn))
+                tasks.append(t)
+
+                # Real-time pacing
+                await asyncio.sleep(interval)
+
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n[!] Stream interrupted by user.")
+    finally:
+        stop_event.set()
+        reporter_task.cancel()
+        elapsed = time.time() - start_wall
+        precision = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
+        recall = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
+        print("\n" + "=" * 70)
+        print("Final Stream Summary:")
+        print(f"Elapsed Time:    {elapsed:.2f} seconds")
+        print(f"Total Sent:      {total_sent}")
+        print(f"Errors:          {total_errors}")
+        print(f"Flagged Alerts:  {total_flagged}")
+        print(f"Live Precision:  {precision:.2f}% (TP={tp}, FP={fp})")
+        print(f"Live Recall:     {recall:.2f}% (TP={tp}, FN={fn})")
+        print("=" * 70)
 
 
-def cmd_dataset(n: int, seed: int, out: str) -> None:
-    """Write a labeled CSV sorted by timestamp and print class balance."""
-    txns = _build_dataset(n, seed)
-    path = Path(out)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    n_scam = 0
-    by_type: dict[str, int] = {}
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+def run_dataset(n: int = 50000, seed: int = 42, out_path: str = "data/transactions_labeled.csv") -> None:
+    """Generate n labeled transactions and export to CSV sorted by timestamp."""
+    print("=" * 70)
+    print(f"Generating synthetic dataset: {n} transactions (seed={seed})")
+    print(f"Output path: {out_path}")
+    print("=" * 70)
+
+    # 4% scam rate
+    scam_rate = 0.04
+    pool = AccountPool(n_accounts=2000, seed=seed)
+    start_time = datetime(2026, 10, 17, 0, 0, 0, tzinfo=timezone.utc)
+    b_stream = benign_stream(pool, start=start_time, rate_per_sec=20.0, seed=seed)
+
+    # Compute approximate benign count to reach n after injection
+    n_benign = max(100, int(n * (1.0 - scam_rate)))
+    benign_txns = [next(b_stream) for _ in range(n_benign)]
+
+    all_txns = inject_scenarios(benign_txns, pool, scam_rate=scam_rate, seed=seed)
+
+    # Ensure exactly n rows
+    if len(all_txns) > n:
+        all_txns = all_txns[:n]
+    elif len(all_txns) < n:
+        needed = n - len(all_txns)
+        extra_benign = [next(b_stream) for _ in range(needed)]
+        all_txns.extend(extra_benign)
+        all_txns.sort(key=lambda t: t.timestamp)
+
+    # Ensure output dir exists
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    counts: dict[str, int] = {"none": 0}
+    scam_count = 0
+
+    fieldnames = [
+        "txn_id",
+        "timestamp",
+        "sender_token",
+        "receiver_token",
+        "amount",
+        "channel",
+        "device_token",
+        "memo",
+        "is_scam",
+        "typology",
+    ]
+
+    with open(out_path, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for txn in txns:
-            truth = txn.truth
-            is_scam = bool(truth and truth.is_scam)
-            typology = truth.typology if truth else "none"
-            n_scam += int(is_scam)
-            by_type[typology] = by_type.get(typology, 0) + 1
+        for txn in all_txns:
+            is_scam = txn.truth.is_scam if txn.truth else False
+            typology = txn.truth.typology if txn.truth else "none"
+
+            counts[typology] = counts.get(typology, 0) + 1
+            if is_scam:
+                scam_count += 1
+
             writer.writerow(
                 {
                     "txn_id": txn.txn_id,
                     "timestamp": txn.timestamp,
                     "sender_token": txn.sender_token,
                     "receiver_token": txn.receiver_token,
-                    "amount": txn.amount,
+                    "amount": f"{txn.amount:.2f}",
                     "channel": txn.channel,
                     "device_token": txn.device_token,
                     "memo": txn.memo or "",
-                    "is_scam": is_scam,
+                    "is_scam": "True" if is_scam else "False",
                     "typology": typology,
                 }
             )
-    total = len(txns)
-    share = (n_scam / total) if total else 0.0
-    print(f"wrote {total} rows to {path}")
-    print(f"scam={n_scam} share={share:.4f} mix={by_type}")
+
+    benign_count = n - scam_count
+    print(f"Successfully generated {len(all_txns)} transactions.")
+    print("\nClass Balance:")
+    print(f"  Total:      {n:,}")
+    print(f"  Benign:     {benign_count:,} ({benign_count / n * 100:.2f}%)")
+    print(f"  Scam:       {scam_count:,} ({scam_count / n * 100:.2f}%)")
+    print("\nTypology Breakdown:")
+    for typ, c in sorted(counts.items()):
+        print(f"  - {typ:<20}: {c:5d} ({c / n * 100:.2f}%)")
+    print(f"\nSaved to: {os.path.abspath(out_path)}")
 
 
-async def _post_txn(
-    client: httpx.AsyncClient,
-    sem: asyncio.Semaphore,
-    url: str,
-    payload: dict,
-) -> tuple[bool, dict | None]:
-    async with sem:
-        last_error: Exception | None = None
-        for _ in range(3):
-            try:
-                resp = await client.post(url, json=payload, timeout=5.0)
-                resp.raise_for_status()
-                return True, resp.json()
-            except (httpx.HTTPError, ValueError) as exc:
-                last_error = exc
-        return False, {"error": str(last_error)}
+def run_burst(
+    typology: str,
+    api_url: str = "http://localhost:8000",
+) -> None:
+    """Post ONE immediate scam burst scenario to trigger a live demo alert."""
+    print("=" * 70)
+    print(f"Aegis Exchange - Injecting Live Scam Burst: '{typology}'")
+    print(f"Target API: {api_url}/v1/transactions")
+    print("=" * 70)
 
+    pool = AccountPool(n_accounts=500, seed=int(time.time() * 1000) % 100000)
+    rng = np.random.default_rng()
+    t0 = datetime.now(timezone.utc)
 
-async def cmd_stream(api_url: str, rate: float, duration: int, scam_rate: float, seed: int) -> None:
-    """Generate a window of traffic and POST it at ``rate`` txns/sec."""
-    n = max(1, int(round(rate * duration)))
-    txns = _build_dataset(n, seed, scam_rate=scam_rate)
-    url = api_url.rstrip("/") + "/v1/transactions"
-    sem = asyncio.Semaphore(20)
-    stop = asyncio.Event()
+    if typology == "mule_fan_in":
+        txns = mule_fan_in(pool, t0, rng)
+    elif typology == "rapid_forwarding":
+        txns = rapid_forwarding(pool, t0, rng)
+    elif typology == "circular_layering":
+        txns = circular_layering(pool, t0, rng)
+    elif typology == "account_takeover":
+        txns = account_takeover(pool, t0, rng)
+    else:
+        print(f"[!] Unknown typology: {typology}")
+        sys.exit(1)
 
-    def _handle_sigint(*_args: object) -> None:
-        stop.set()
+    print(f"Generated {len(txns)} transactions for burst scenario '{typology}'.")
+    endpoint = f"{api_url.rstrip('/')}/v1/transactions"
 
-    try:
-        signal.signal(signal.SIGINT, _handle_sigint)
-    except (ValueError, OSError):
-        pass
-
-    sent = 0
-    errors = 0
-    flagged = 0
-    tp = fp = fn = tn = 0
-    started = time.perf_counter()
-    last_print = started
-
-    def summary() -> None:
-        prec = tp / (tp + fp) if (tp + fp) else 0.0
-        rec = tp / (tp + fn) if (tp + fn) else 0.0
-        elapsed = time.perf_counter() - started
-        print(
-            f"sent={sent} errors={errors} flagged={flagged} "
-            f"precision={prec:.3f} recall={rec:.3f} elapsed_s={elapsed:.1f}"
-        )
-
-    async with httpx.AsyncClient() as client:
-        tasks: list[asyncio.Task[None]] = []
-
-        async def send_one(i: int, txn: Transaction) -> None:
-            nonlocal sent, errors, flagged, tp, fp, fn, tn, last_print
-            if stop.is_set():
-                return
-            target = started + (i / rate if rate > 0 else 0.0)
-            delay = target - time.perf_counter()
-            if delay > 0:
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=delay)
-                    return
-                except TimeoutError:
-                    pass
+    alerts_triggered = 0
+    with httpx.Client(timeout=10.0) as client:
+        for i, txn in enumerate(txns, start=1):
             payload = txn.to_payload()
-            ok, body = await _post_txn(client, sem, url, payload)
-            is_scam = bool(txn.truth and txn.truth.is_scam)
-            if not ok:
-                errors += 1
-            else:
-                sent += 1
-                risk_level = str((body or {}).get("risk_level", "LOW"))
-                is_flag = risk_level != "LOW"
-                if is_flag:
-                    flagged += 1
-                if is_flag and is_scam:
-                    tp += 1
-                elif is_flag and not is_scam:
-                    fp += 1
-                elif (not is_flag) and is_scam:
-                    fn += 1
+            try:
+                resp = client.post(endpoint, json=payload)
+                if resp.status_code in (200, 201):
+                    data = resp.json()
+                    risk = data.get("risk_level", "UNKNOWN")
+                    score = data.get("risk_score", 0.0)
+                    alert_id = data.get("alert_id")
+                    if alert_id:
+                        alerts_triggered += 1
+                    print(
+                        f"  [{i}/{len(txns)}] Sent {txn.amount:>8.2f} INR | "
+                        f"{txn.sender_token[:6]}... -> {txn.receiver_token[:6]}... | "
+                        f"Risk: {risk:<6} ({score:.4f}) | Alert ID: {alert_id}"
+                    )
                 else:
-                    tn += 1
-            now = time.perf_counter()
-            if now - last_print >= 5.0:
-                last_print = now
-                summary()
+                    print(f"  [{i}/{len(txns)}] Error {resp.status_code}: {resp.text}")
+            except Exception as e:
+                print(f"  [{i}/{len(txns)}] Request failed: {e}")
 
-        for i, txn in enumerate(txns):
-            if stop.is_set():
-                break
-            tasks.append(asyncio.create_task(send_one(i, txn)))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-    summary()
-    print("stream finished")
+    print("\n" + "=" * 70)
+    print(f"Burst Injection Complete: {len(txns)} sent, {alerts_triggered} alert(s) triggered.")
+    print("=" * 70)
 
 
-async def cmd_burst(api_url: str, typology: str) -> None:
-    """Post one scam scenario with current timestamps (live demo alert)."""
-    rng = __import__("numpy").random.default_rng(int(time.time()) % 10_000)
-    pool = AccountPool(n_accounts=2000, seed=42)
-    now = datetime.now(timezone.utc)
-    txns = TYPOLOGY_FNS[typology](pool, now, rng)
-    url = api_url.rstrip("/") + "/v1/transactions"
-    async with httpx.AsyncClient() as client:
-        sem = asyncio.Semaphore(20)
-        for txn in txns:
-            ok, body = await _post_txn(client, sem, url, txn.to_payload())
-            print(f"{txn.txn_id} ok={ok} body={body}")
-    print(f"burst {typology} posted n={len(txns)}")
+def main() -> None:
+    """CLI entrypoint."""
+    default_api_url = os.getenv("AEGIS_API_URL", "http://localhost:8000")
 
+    parser = argparse.ArgumentParser(
+        prog="python -m simulator.main",
+        description="Aegis Exchange - Part 1 Simulation CLI",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="simulator.main", description="Aegis Exchange Part 1")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    # Subcommand: stream
+    p_stream = subparsers.add_parser("stream", help="Stream transactions to API in real-time")
+    p_stream.add_argument("--api-url", default=default_api_url, help=f"API base URL (default: {default_api_url})")
+    p_stream.add_argument("--rate", type=float, default=20.0, help="Send rate in txns/sec (default: 20)")
+    p_stream.add_argument("--duration", type=float, default=300.0, help="Stream duration in seconds (default: 300)")
+    p_stream.add_argument("--scam-rate", type=float, default=0.04, help="Target scam fraction (default: 0.04)")
+    p_stream.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
 
-    p_stream = sub.add_parser("stream", help="replay a synthetic stream into the API")
-    p_stream.add_argument("--api-url", default=DEFAULT_API)
-    p_stream.add_argument("--rate", type=float, default=20.0)
-    p_stream.add_argument("--duration", type=int, default=300)
-    p_stream.add_argument("--scam-rate", type=float, default=0.04)
-    p_stream.add_argument("--seed", type=int, default=42)
+    # Subcommand: dataset
+    p_dataset = subparsers.add_parser("dataset", help="Generate labeled CSV dataset for training")
+    p_dataset.add_argument("--n", type=int, default=50000, help="Number of transactions (default: 50000)")
+    p_dataset.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    p_dataset.add_argument("--out", default="data/transactions_labeled.csv", help="Output file path")
 
-    p_ds = sub.add_parser("dataset", help="write labeled CSV")
-    p_ds.add_argument("--n", type=int, default=50_000)
-    p_ds.add_argument("--seed", type=int, default=42)
-    p_ds.add_argument("--out", default="data/transactions_labeled.csv")
-
-    p_burst = sub.add_parser("burst", help="post one scam scenario now")
+    # Subcommand: burst
+    p_burst = subparsers.add_parser("burst", help="Post an immediate scam scenario for live demo alerts")
     p_burst.add_argument(
         "--typology",
         required=True,
-        choices=list(TYPOLOGY_FNS.keys()),
+        choices=["mule_fan_in", "rapid_forwarding", "circular_layering", "account_takeover"],
+        help="Typology to trigger",
     )
-    p_burst.add_argument("--api-url", default=DEFAULT_API)
-    return parser
+    p_burst.add_argument("--api-url", default=default_api_url, help=f"API base URL (default: {default_api_url})")
 
+    args = parser.parse_args()
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    try:
-        if args.cmd == "dataset":
-            cmd_dataset(n=args.n, seed=args.seed, out=args.out)
-            return 0
-        if args.cmd == "stream":
-            asyncio.run(
-                cmd_stream(
-                    api_url=args.api_url,
-                    rate=args.rate,
-                    duration=args.duration,
-                    scam_rate=args.scam_rate,
-                    seed=args.seed,
-                )
+    if args.command == "stream":
+        asyncio.run(
+            run_stream(
+                api_url=args.api_url,
+                rate=args.rate,
+                duration=args.duration,
+                scam_rate=args.scam_rate,
+                seed=args.seed,
             )
-            return 0
-        if args.cmd == "burst":
-            asyncio.run(cmd_burst(api_url=args.api_url, typology=args.typology))
-            return 0
-    except KeyboardInterrupt:
-        print("\ninterrupted — exiting with summary above if any", file=sys.stderr)
-        return 130
-    return 1
+        )
+    elif args.command == "dataset":
+        run_dataset(n=args.n, seed=args.seed, out_path=args.out)
+    elif args.command == "burst":
+        run_burst(typology=args.typology, api_url=args.api_url)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
